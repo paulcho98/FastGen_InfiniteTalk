@@ -48,16 +48,21 @@ class InfiniteTalkSelfForcingModel(SelfForcingModel):
         super().__init__(config)
 
     def build_model(self):
-        """Override to instantiate fake_score from config.fake_score_net if provided.
+        """Build model, then re-apply LoRA freeze on student and fake_score.
 
-        The base DMD2Model.build_model() now natively checks config.fake_score_net,
-        so this override is only needed if additional logic is required. Kept for
-        backward compatibility and explicitness.
+        FastGenModel.build_model() calls requires_grad_(True) on the entire
+        student network, overriding freeze_base() from the constructor.
+        The base dmd2.py handles fake_score_net instantiation natively.
         """
         super().build_model()
 
-        # The base dmd2.py now handles fake_score_net natively.
-        # If additional per-model-class logic is needed later, add it here.
+        # Re-freeze base weights on the student (net)
+        from fastgen.networks.InfiniteTalk.lora import freeze_base
+        freeze_base(self.net)
+
+        # Also freeze base on fake_score if it has LoRA
+        if hasattr(self, 'fake_score') and hasattr(self.fake_score, '_use_gradient_checkpointing'):
+            freeze_base(self.fake_score)
 
     def _prepare_training_data(self, data: Dict[str, Any]) -> tuple[torch.Tensor, Any, Any]:
         """Build InfiniteTalk condition and neg_condition dicts from dataset output.

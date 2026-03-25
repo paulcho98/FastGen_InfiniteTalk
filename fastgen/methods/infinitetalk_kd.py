@@ -35,6 +35,16 @@ class InfiniteTalkKDModel(CausalKDModel):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
 
+    def build_model(self):
+        """Build model then re-apply LoRA freeze.
+
+        FastGenModel.build_model() calls requires_grad_(True) on the entire
+        network, overriding freeze_base() from the constructor. Re-apply here.
+        """
+        super().build_model()
+        from fastgen.networks.InfiniteTalk.lora import freeze_base
+        freeze_base(self.net)
+
     def _build_condition(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Build InfiniteTalk condition dict from data batch.
 
