@@ -449,6 +449,14 @@ def extract_ode_trajectory(
     # Compute subsample indices from the schedule
     subsample_indices = compute_subsample_indices(t_schedule, target_t_list)
 
+    # Early stopping: only run ODE steps up to the last needed subsample index.
+    # The clean state (t=0.0, index -1) uses GT data["real"], not the ODE solve,
+    # so we don't need to run the full solve.
+    max_needed_step = max(
+        idx for idx in subsample_indices if idx >= 0
+    )
+    actual_num_steps = min(num_steps, max_needed_step + 1)
+
     # Initialize from pure noise, scaled by initial sigma
     noise = torch.randn(1, *latent_shape, device=device, dtype=dtype)
     x_t = noise_scheduler.latents(noise=noise, t_init=t_schedule[0].to(dtype))
@@ -456,7 +464,7 @@ def extract_ode_trajectory(
     # Collect trajectory states (including initial noisy state)
     trajectory = [x_t.clone()]
 
-    for step_idx in range(num_steps):
+    for step_idx in range(actual_num_steps):
         t_cur = t_schedule[step_idx]
         t_next = t_schedule[step_idx + 1]
 
@@ -502,15 +510,12 @@ def extract_ode_trajectory(
 
         trajectory.append(x_t.clone())
 
-    # Stack trajectory: [1, num_steps+1, C, T, H, W]
+    # Stack trajectory: [1, actual_num_steps+1, C, T, H, W]
     trajectory = torch.stack(trajectory, dim=1)
 
-    # Resolve negative indices and subsample
-    total_states = trajectory.shape[1]
-    resolved_indices = [
-        idx if idx >= 0 else total_states + idx for idx in subsample_indices
-    ]
-    subsampled = trajectory[:, resolved_indices]
+    # Subsample: only keep non-negative indices (skip t=0.0 which uses GT)
+    valid_indices = [idx for idx in subsample_indices if idx >= 0]
+    subsampled = trajectory[:, valid_indices]
 
     return subsampled.squeeze(0)  # [num_subsample, C, T, H, W]
 
