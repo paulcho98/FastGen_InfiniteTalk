@@ -24,7 +24,8 @@
 | Task 9: Method Subclasses | DONE | DF, KD, SF methods |
 | Task 10: Config Files | DONE | Method + experiment configs |
 | Task 11: Base FastGen Mods | DONE | fake_score_net, dtype, registered classes |
-| Task 12: DF E2E Test | **BLOCKED** | Forward pass works. OOM during backward. See details below. |
+| Task 12: DF E2E Test | DONE | 20 iters, 47s/iter, 67.5GB peak, single A100 |
+| Task 5c: ODE Script | DONE | 3 samples extracted (~23 min/sample). Early stopping added. |
 
 ---
 
