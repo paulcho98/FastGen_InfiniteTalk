@@ -37,8 +37,9 @@ def create_config():
     # Use stdout logger, no wandb
     config.trainer.callbacks = {"stdout": L(StdoutLoggerCallback)()}
 
-    # Disable FSDP/DDP for single-GPU test
-    config.trainer.fsdp = False
+    # 2-GPU FSDP — 14B model doesn't fit on single A100 for training
+    # (38GB model + activations > 80GB even with grad checkpointing)
+    config.trainer.fsdp = True
     config.trainer.ddp = False
 
     # Dataloader pointing to our precomputed test data

@@ -1263,6 +1263,20 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         self.block_mask = None
         self._cached_audio = None
 
+    def fully_shard(self, **kwargs):
+        """Apply FSDP2 sharding to transformer blocks.
+
+        Shards each block individually for maximum memory efficiency,
+        then wraps the remaining parameters.
+        """
+        from torch.distributed._composable.fsdp import fully_shard
+
+        # Shard each transformer block independently
+        for block in self.blocks:
+            fully_shard(block, **kwargs)
+        # Shard remaining top-level params (embeddings, head, etc.)
+        fully_shard(self, **kwargs)
+
     # ------------------------------------------------------------------
     # Internal forward (full-sequence mode)
     # ------------------------------------------------------------------

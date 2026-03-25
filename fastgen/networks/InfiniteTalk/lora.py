@@ -37,16 +37,22 @@ logger = logging.getLogger(__name__)
 # transformer blocks.  Matched against the *full dotted name* of the child
 # nn.Linear relative to the model root (e.g. "blocks.0.self_attn.q").
 DEFAULT_TARGET_PATTERNS: Tuple[str, ...] = (
+    # Self-attention
     "self_attn.q",
     "self_attn.k",
     "self_attn.v",
     "self_attn.o",
+    # Text/CLIP cross-attention
     "cross_attn.q",
     "cross_attn.k",      # text k (inherited from WanSelfAttention)
     "cross_attn.v",      # text v (inherited from WanSelfAttention)
     "cross_attn.k_img",
     "cross_attn.v_img",
     "cross_attn.o",
+    # Audio cross-attention (SingleStreamAttention) — LoRA instead of full fine-tune
+    "audio_cross_attn.q_linear",
+    "audio_cross_attn.kv_linear",
+    "audio_cross_attn.proj",
     "ffn.0",
     "ffn.2",
 )
@@ -59,8 +65,10 @@ EXCLUDE_PATTERNS: Tuple[str, ...] = (
     "time_projection",
     "head",
     "img_emb",
-    "audio_proj",
-    "audio_cross_attn",
+    "audio_proj",       # AudioProjModel: full fine-tune (74M, small enough)
+    # NOTE: audio_cross_attn is NOT excluded — it gets LoRA via target patterns.
+    # audio_cross_attn norms (q_norm, k_norm, add_q_norm, add_k_norm) are not
+    # nn.Linear so they won't match and stay frozen.
 )
 
 
@@ -203,13 +211,24 @@ def apply_lora(
 # freeze_base — freeze everything except LoRA + audio
 # ---------------------------------------------------------------------------
 
-def freeze_base(model: nn.Module) -> None:
-    """Freeze all parameters, then unfreeze LoRA adapters and audio modules.
+def freeze_base(
+    model: nn.Module,
+    train_audio_cross_attn: bool = False,
+) -> None:
+    """Freeze all parameters, then unfreeze LoRA adapters and audio projection.
 
     After calling this function:
       - Base transformer weights: frozen (requires_grad=False)
       - ``lora_A`` / ``lora_B`` parameters: trainable
-      - ``audio_proj`` / ``audio_cross_attn`` parameters: trainable
+      - ``audio_proj`` (AudioProjModel) parameters: trainable (~74M)
+      - ``audio_cross_attn`` (SingleStreamAttention): frozen by default
+        (set ``train_audio_cross_attn=True`` to unfreeze — adds ~2.4B trainable
+        params, requires multi-GPU FSDP)
+
+    The audio_cross_attn layers are pre-trained by InfiniteTalk and already
+    represent well-learned audio-visual attention.  For Self-Forcing distillation
+    (which targets few-step inference), keeping them frozen is sufficient and
+    allows single-GPU training.
     """
     # 1. Freeze everything
     for p in model.parameters():
@@ -222,19 +241,28 @@ def freeze_base(model: nn.Module) -> None:
             p.requires_grad = True
             lora_count += 1
 
-    # 3. Unfreeze audio modules (AudioProjModel + SingleStreamAttention)
-    audio_count = 0
+    # 3. Unfreeze AudioProjModel (the projection from wav2vec2 to context tokens)
+    audio_proj_count = 0
     for name, p in model.named_parameters():
-        if "audio_proj" in name or "audio_cross_attn" in name:
+        if "audio_proj" in name:
             p.requires_grad = True
-            audio_count += 1
+            audio_proj_count += 1
+
+    # 4. Optionally unfreeze audio cross-attention (2.4B params — needs FSDP)
+    audio_attn_count = 0
+    if train_audio_cross_attn:
+        for name, p in model.named_parameters():
+            if "audio_cross_attn" in name:
+                p.requires_grad = True
+                audio_attn_count += 1
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(
         f"[freeze_base] Trainable: {trainable_params:,} / {total_params:,} params "
         f"({trainable_params / total_params * 100:.2f}%) — "
-        f"{lora_count} LoRA params, {audio_count} audio params"
+        f"{lora_count} LoRA, {audio_proj_count} audio_proj, "
+        f"{audio_attn_count} audio_cross_attn"
     )
 
 
