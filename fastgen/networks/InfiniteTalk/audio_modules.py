@@ -179,6 +179,10 @@ class SingleStreamAttention(nn.Module):
             q = self.q_norm(q)
 
         # KV from audio encoder_hidden_states
+        # Handle both [B*N_t, N_a, C] (pre-reshaped) and [B, N_t, N_a, C] (from AudioProjModel)
+        if encoder_hidden_states.dim() == 4:
+            encoder_hidden_states = rearrange(
+                encoder_hidden_states, "b n_t n_a c -> (b n_t) n_a c")
         _, N_a, _ = encoder_hidden_states.shape
         encoder_kv = self.kv_linear(encoder_hidden_states)
         encoder_kv_shape = (B, N_a, 2, self.num_heads, self.head_dim)

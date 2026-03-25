@@ -1343,12 +1343,17 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         assert t_emb.dtype == torch.float32 and t_mod.dtype == torch.float32
 
         # Text embedding
+        # context (text_embeds) can be [B, 1, 512, 4096] or [B, 512, 4096]
         context_lens = None
+        if context.dim() == 4:
+            context = context.squeeze(1)  # [B, 1, 512, 4096] -> [B, 512, 4096]
+        # Pad to text_len and pass through text_embedding
         context = self.text_embedding(
             torch.stack([
                 torch.cat([
                     u, u.new_zeros(self._text_len - u.size(0), u.size(1))
-                ]) for u in [context[i] for i in range(context.shape[0])]
+                ]) if u.size(0) < self._text_len else u[:self._text_len]
+                for u in [context[i] for i in range(context.shape[0])]
             ])
         )
 
@@ -1475,12 +1480,17 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         assert t_emb.dtype == torch.float32 and t_mod.dtype == torch.float32
 
         # Text embedding
+        # context (text_embeds) can be [B, 1, 512, 4096] or [B, 512, 4096]
         context_lens = None
+        if context.dim() == 4:
+            context = context.squeeze(1)  # [B, 1, 512, 4096] -> [B, 512, 4096]
+        # Pad to text_len and pass through text_embedding
         context = self.text_embedding(
             torch.stack([
                 torch.cat([
                     u, u.new_zeros(self._text_len - u.size(0), u.size(1))
-                ]) for u in [context[i] for i in range(context.shape[0])]
+                ]) if u.size(0) < self._text_len else u[:self._text_len]
+                for u in [context[i] for i in range(context.shape[0])]
             ])
         )
 
@@ -1619,6 +1629,22 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         # Handle text_embeds shape: [B, 1, 512, 4096] -> [B, 512, 4096]
         if text_embeds.dim() == 4:
             text_embeds = text_embeds.squeeze(1)
+
+        # Handle clip_features shape: [B, 1, 257, 1280] -> [B, 257, 1280]
+        if clip_features.dim() == 4:
+            clip_features = clip_features.squeeze(1)
+
+        # Apply 5-frame sliding window to audio if not already windowed.
+        # Dataset provides [B, num_video_frames, 12, 768] (raw per-frame).
+        # Model expects [B, num_video_frames, 5, 12, 768] (windowed).
+        if audio_emb is not None and audio_emb.dim() == 4:
+            # audio_emb: [B, num_frames, 12, 768] -> apply 5-frame window
+            num_frames = audio_emb.shape[1]
+            half_win = self._audio_window // 2  # 2 for window=5
+            indices = torch.arange(self._audio_window, device=audio_emb.device) - half_win  # [-2,-1,0,1,2]
+            center_indices = torch.arange(num_frames, device=audio_emb.device).unsqueeze(1) + indices.unsqueeze(0)
+            center_indices = center_indices.clamp(0, num_frames - 1)  # [num_frames, 5]
+            audio_emb = audio_emb[:, center_indices]  # [B, num_frames, 5, 12, 768]
 
         B, C, T, H, W = x_t.shape
 
