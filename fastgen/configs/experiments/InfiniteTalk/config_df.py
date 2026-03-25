@@ -44,9 +44,9 @@ CausalInfiniteTalk_14B_Student: dict = L(CausalInfiniteTalkWan)(
 def create_config():
     config = config_df_default.create_config()
 
-    # Precision
+    # Precision — bf16 throughout for 14B model
     config.model.precision = "bfloat16"
-    config.model.precision_fsdp = "float32"
+    config.model.precision_fsdp = "bfloat16"
 
     # Input shape: 640x640 @ 81 frames -> latent [16, 21, 80, 80]
     config.model.input_shape = [16, 21, 80, 80]

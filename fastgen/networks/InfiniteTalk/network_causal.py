@@ -1266,16 +1266,26 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
     def fully_shard(self, **kwargs):
         """Apply FSDP2 sharding to transformer blocks.
 
-        Shards each block individually for maximum memory efficiency,
-        then wraps the remaining parameters.
+        Note: We shard individual blocks and a wrapper Module rather than
+        ``self`` because the network wrapper class uses ABC inheritance
+        which causes Python's ``__class__`` assignment to fail due to
+        incompatible memory layouts.  FSDP2's ``fully_shard`` works by
+        dynamically modifying ``__class__``, so we apply it only to
+        standard ``torch.nn.Module`` submodules.
         """
         from torch.distributed._composable.fsdp import fully_shard
 
         # Shard each transformer block independently
         for block in self.blocks:
             fully_shard(block, **kwargs)
-        # Shard remaining top-level params (embeddings, head, etc.)
-        fully_shard(self, **kwargs)
+
+        # Shard other large submodules (embeddings, head)
+        # Don't shard self (ABC __class__ layout incompatibility)
+        for name, child in self.named_children():
+            if name == "blocks":
+                continue  # already sharded above
+            if sum(p.numel() for p in child.parameters()) > 0:
+                fully_shard(child, **kwargs)
 
     # ------------------------------------------------------------------
     # Internal forward (full-sequence mode)
