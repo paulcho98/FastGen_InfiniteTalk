@@ -457,12 +457,26 @@ def extract_ode_trajectory(
     )
     actual_num_steps = min(num_steps, max_needed_step + 1)
 
-    # Initialize from pure noise, scaled by initial sigma
+    # Initialize from pure noise (matching InfiniteTalk's original initialization)
+    # The original uses unscaled noise: latent = torch.randn(...)
+    # For RF with shift=7.0, t_schedule[0] ≈ 1.0, so sigma ≈ 1.0
+    # and ns.latents(noise, t=1.0) ≈ noise * 1.0 anyway.
     noise = torch.randn(1, *latent_shape, device=device, dtype=dtype)
-    x_t = noise_scheduler.latents(noise=noise, t_init=t_schedule[0].to(dtype))
+    x_t = noise  # raw noise, same as original pipeline
 
     # Collect trajectory states (including initial noisy state)
     trajectory = [x_t.clone()]
+
+    # The timestep schedule is in [0, 1) range (FastGen convention).
+    # The teacher wrapper expects t in [0, 1) and internally rescales to [0, 1000).
+    # The original InfiniteTalk Euler step uses raw velocity (flow) predictions:
+    #   noise_pred = model(x_t, t, ...)              # raw flow velocity
+    #   noise_pred = -noise_pred                      # negate (InfiniteTalk convention)
+    #   dt = (t_cur - t_next) / num_timesteps         # in [0, 1000) scale
+    #   x_t = x_t + noise_pred * dt
+    #
+    # We use the teacher wrapper with DEFAULT pred_type (flow) — no fwd_pred_type="x0".
+    # This returns the raw flow velocity v, matching the original model's output.
 
     for step_idx in range(actual_num_steps):
         t_cur = t_schedule[step_idx]
@@ -471,42 +485,36 @@ def extract_ode_trajectory(
         # Broadcast timestep to batch dim [B=1]
         t_tensor = torch.full((1,), t_cur.item(), device=device, dtype=dtype)
 
-        # --- 3-call CFG ---
+        # --- 3-call CFG on raw flow velocity ---
         # Call 1: Full condition (text + audio)
-        x0_cond = teacher(
-            x_t, t_tensor, condition=condition, fwd_pred_type="x0",
+        v_cond = teacher(
+            x_t, t_tensor, condition=condition,
         )
 
         # Call 2: Drop text (neg text + audio)
-        x0_drop_text = teacher(
-            x_t, t_tensor, condition=neg_text_condition, fwd_pred_type="x0",
+        v_drop_text = teacher(
+            x_t, t_tensor, condition=neg_text_condition,
         )
 
         # Call 3: Drop both (neg text + zero audio)
-        x0_uncond = teacher(
-            x_t, t_tensor, condition=neg_condition, fwd_pred_type="x0",
+        v_uncond = teacher(
+            x_t, t_tensor, condition=neg_condition,
         )
 
-        # Combine with 3-call CFG formula
-        x0_guided = (
-            x0_uncond
-            + text_guide_scale * (x0_cond - x0_drop_text)
-            + audio_guide_scale * (x0_drop_text - x0_uncond)
+        # Combine with 3-call CFG formula (on velocity, same as original)
+        v_guided = (
+            v_uncond
+            + text_guide_scale * (v_cond - v_drop_text)
+            + audio_guide_scale * (v_drop_text - v_uncond)
         )
 
-        # --- Euler step ---
-        if t_next > 0:
-            # Convert x0 prediction to eps: eps = (x_t - alpha*x0) / sigma
-            eps = noise_scheduler.x0_to_eps(xt=x_t, x0=x0_guided, t=t_tensor)
+        # --- Euler step (matching InfiniteTalk multitalk.py lines 758-763) ---
+        # Negate the velocity (InfiniteTalk convention)
+        v_guided = -v_guided
 
-            # Forward process to next timestep: x_{t_next} = alpha(t_next)*x0 + sigma(t_next)*eps
-            t_next_tensor = torch.full(
-                (1,), t_next.item(), device=device, dtype=dtype,
-            )
-            x_t = noise_scheduler.forward_process(x0_guided, eps, t_next_tensor)
-        else:
-            # Final step: x0 is the clean prediction
-            x_t = x0_guided
+        # dt in the original uses timesteps in [0, 1000] range
+        dt = (t_cur - t_next)  # already in [0, 1) range since t_schedule = timesteps / 1000
+        x_t = x_t + v_guided * dt
 
         trajectory.append(x_t.clone())
 
