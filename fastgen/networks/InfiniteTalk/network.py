@@ -498,8 +498,23 @@ class InfiniteTalkWan(FastGenNetwork):
         )
 
         text_embeds = condition["text_embeds"]          # [B, 1, 512, 4096] or [B, 512, 4096]
-        clip_features = condition["clip_features"]      # [B, 257, 1280]
-        audio_emb = condition["audio_emb"]              # [B, num_frames, audio_window, 12, 768]
+        clip_features = condition["clip_features"]      # [B, 257, 1280] or [B, 1, 257, 1280]
+        audio_emb = condition["audio_emb"]              # [B, num_frames, 12, 768] or [B, num_frames, 5, 12, 768]
+
+        # Handle extra dims from dataset collation
+        if text_embeds.dim() == 4:
+            text_embeds = text_embeds.squeeze(1)
+        if clip_features.dim() == 4:
+            clip_features = clip_features.squeeze(1)
+
+        # Apply 5-frame sliding window to audio if not already windowed
+        if audio_emb is not None and audio_emb.dim() == 4:
+            num_frames = audio_emb.shape[1]
+            half_win = 5 // 2  # audio_window=5
+            indices = torch.arange(5, device=audio_emb.device) - half_win
+            center_indices = torch.arange(num_frames, device=audio_emb.device).unsqueeze(1) + indices.unsqueeze(0)
+            center_indices = center_indices.clamp(0, num_frames - 1)
+            audio_emb = audio_emb[:, center_indices]  # [B, num_frames, 5, 12, 768]
 
         B, C, T, H, W = x_t.shape
 
