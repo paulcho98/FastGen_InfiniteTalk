@@ -38,6 +38,19 @@ class InfiniteTalkDiffusionForcingModel(KDModel):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
 
+    def build_model(self):
+        """Build model then re-apply LoRA freeze.
+
+        The base ``FastGenModel.build_model()`` calls ``requires_grad_(True)``
+        on the entire network after instantiation, which undoes our
+        ``freeze_base()`` call in the CausalInfiniteTalkWan constructor.
+        We re-apply it here.
+        """
+        super().build_model()
+        # Re-freeze base weights -- FastGenModel.build_model() set requires_grad_(True) on all
+        from fastgen.networks.InfiniteTalk.lora import freeze_base
+        freeze_base(self.net)
+
     def _build_condition(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Build InfiniteTalk condition dict from data batch.
 
@@ -61,19 +74,10 @@ class InfiniteTalkDiffusionForcingModel(KDModel):
         input_student: torch.Tensor = None,
         condition: Any = None,
     ) -> Dict[str, torch.Tensor | Callable]:
-        noise = torch.randn_like(gen_data, dtype=self.precision)
-        context_noise = getattr(self.config, "context_noise", 0)
-        gen_rand_func = partial(
-            CausVidModel.generator_fn,
-            net=self.net_inference,
-            noise=noise,
-            condition=condition,
-            student_sample_steps=self.config.student_sample_steps,
-            t_list=self.config.sample_t_cfg.t_list,
-            context_noise=context_noise,
-            precision_amp=self.precision_amp_infer,
-        )
-        return {"gen_rand": gen_rand_func, "input_rand": noise, "gen_rand_train": gen_data}
+        # Return minimal outputs to avoid holding autograd graph references
+        # during backward. The gen_rand_func closure would capture condition
+        # and keep all condition tensors alive through the backward pass.
+        return {"gen_rand_train": gen_data}
 
     def single_train_step(
         self, data: Dict[str, Any], iteration: int
@@ -108,10 +112,11 @@ class InfiniteTalkDiffusionForcingModel(KDModel):
         # Student denoise
         gen_data = self.gen_data_from_net(noisy_data, t_inhom, condition=condition)
 
-        # L2 loss
+        # L2 loss — real_data is the target (no grad needed)
         loss = 0.5 * F.mse_loss(gen_data, real_data, reduction="mean")
 
-        loss_map = {"total_loss": loss, "recon_loss": loss}
-        outputs = self._get_outputs(gen_data, condition=condition)
+        # Outputs for logging (detached to avoid holding autograd references)
+        outputs = self._get_outputs(gen_data.detach(), condition=condition)
 
+        loss_map = {"total_loss": loss, "recon_loss": loss.detach()}
         return loss_map, outputs
