@@ -44,14 +44,22 @@ class DMD2Model(FastGenModel):
 
         # instantiate the fake_score and load weights from teacher
         logger.info("Instantiating the fake_score")
-        with self._get_meta_init_context():
-            self.fake_score = instantiate(self.teacher_config)
-        model_path = self.config.pretrained_model_path
-        if model_path is not None and len(model_path) > 0:
-            if (not self.config.fsdp_meta_init) or is_rank0():
-                # Only rank 0 loads weights if using meta initialization
-                self.fake_score.load_state_dict(self.teacher.state_dict())
-            synchronize()
+        fake_score_cfg = getattr(self.config, "fake_score_net", None)
+        if fake_score_cfg is not None:
+            # Use separate fake_score config (different architecture from teacher)
+            logger.info("Instantiating fake_score from config.fake_score_net")
+            with self._get_meta_init_context():
+                self.fake_score = instantiate(fake_score_cfg)
+        else:
+            # Default: clone from teacher architecture and copy weights
+            with self._get_meta_init_context():
+                self.fake_score = instantiate(self.teacher_config)
+            model_path = self.config.pretrained_model_path
+            if model_path is not None and len(model_path) > 0:
+                if (not self.config.fsdp_meta_init) or is_rank0():
+                    # Only rank 0 loads weights if using meta initialization
+                    self.fake_score.load_state_dict(self.teacher.state_dict())
+        synchronize()
 
         if self.config.gan_loss_weight_gen > 0:
             logger.info(f"gan_loss_weight_gen: {self.config.gan_loss_weight_gen}")

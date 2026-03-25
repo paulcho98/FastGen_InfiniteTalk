@@ -20,3 +20,8 @@ from fastgen.methods.fine_tuning.sft import CausalSFTModel as CausalSFTModel
 
 from fastgen.methods.knowledge_distillation.KD import KDModel as KDModel
 from fastgen.methods.knowledge_distillation.KD import CausalKDModel as CausalKDModel
+
+# InfiniteTalk method subclasses
+from fastgen.methods.infinitetalk_diffusion_forcing import InfiniteTalkDiffusionForcingModel as InfiniteTalkDiffusionForcingModel
+from fastgen.methods.infinitetalk_kd import InfiniteTalkKDModel as InfiniteTalkKDModel
+from fastgen.methods.infinitetalk_self_forcing import InfiniteTalkSelfForcingModel as InfiniteTalkSelfForcingModel

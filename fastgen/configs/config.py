@@ -152,6 +152,12 @@ class BaseModelConfig:
     # - Expected speedup: 30+ min -> <1 min for 14B models on 8 GPUs
     fsdp_meta_init: bool = False
 
+    # Separate fake_score network config (allows different architecture from teacher).
+    # When set, DMD2Model.build_model() instantiates fake_score from this instead of
+    # copying teacher weights.  Used by InfiniteTalk/OmniAvatar where fake_score may
+    # differ from teacher (e.g. 1.3B vs 14B, or LoRA vs frozen).
+    fake_score_net: Optional[dict] = None
+
     # whether to add the teacher model to the fsdp_dict
     add_teacher_to_fsdp_dict: bool = True
 

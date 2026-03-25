@@ -347,6 +347,7 @@ class BaseNoiseSchedule(torch.nn.Module):
         sample_steps: int,
         t_list: Optional[list] = None,
         device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Sample block-wise independent t variables for diffusion forcing in distillation.

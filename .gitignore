@@ -181,4 +181,4 @@ wandb/
 *.err
 
 # vscode
-*.vscode/
+*.vscode/data/test_precomputed/
