@@ -8,70 +8,104 @@
 
 ---
 
-## Status Summary (updated 2026-03-26)
+## Status Summary (updated 2026-03-26 end of session)
 
 | Task | Status | Notes |
 |------|--------|-------|
-| Task 0: Environment Setup | DONE | Installed deps. xformers breaks torch; using SDPA. triton 3.2.0 for FlexAttention. |
-| Task 1: Port Standalone DiT | DONE | 788 lines `wan_model.py` |
-| Task 2: Port Audio Modules | DONE | 210 lines `audio_modules.py` |
-| Task 3: LoRA Utilities | DONE | 463 lines `lora.py` — functional tests pass |
-| Task 4: Bidirectional Wrapper | DONE | 591 lines `network.py` — InfiniteTalkWan(FastGenNetwork) |
-| Task 5: Stage 0 Verification | DONE | Level 1: PASS (0 diff), Level 2: PASS (0 diff on 3 real samples) |
-| Task 5b: Precompute TalkVid Data | DONE | 3 test samples precomputed (~10s/sample) |
-| Task 5c: ODE Trajectory Script | Not started | |
-| Task 6: Causal Wrapper | DONE | 1864 lines `network_causal.py` — FlexAttention, KV cache, LoRA |
-| Task 7: Dataset Adapter | DONE | 305 lines `infinitetalk_dataloader.py` |
+| Task 0: Environment Setup | DONE | triton 3.2.0, no xformers |
+| Task 1: Port Standalone DiT | DONE | wan_model.py (788 lines) |
+| Task 2: Port Audio Modules | DONE | audio_modules.py (210 lines) |
+| Task 3: LoRA Utilities | DONE | lora.py (463 lines), LoRA on base DiT + audio_cross_attn |
+| Task 4: Bidirectional Wrapper | DONE | network.py (591 lines) |
+| Task 5: Stage 0 Verification | DONE | BIT-EXACT on 3 real samples (max_diff=0.0) |
+| Task 5b: Precompute Data | DONE | 3 TalkVid samples preprocessed |
+| Task 6: Causal Wrapper | DONE | network_causal.py (1864 lines) |
+| Task 7: Dataset Adapter | DONE | infinitetalk_dataloader.py (305 lines) |
 | Task 9: Method Subclasses | DONE | DF, KD, SF methods |
 | Task 10: Config Files | DONE | Method + experiment configs |
 | Task 11: Base FastGen Mods | DONE | fake_score_net, dtype, registered classes |
-| Task 12: DF E2E Test | **IN PROGRESS** | Forward pass works. OOM on backward (single GPU). Testing with expandable_segments. |
+| Task 12: DF E2E Test | **BLOCKED** | Forward pass works. OOM during backward. See details below. |
 
 ---
 
-## Detailed Log
+## Current Blocker: OOM During Training Backward Pass
 
-### 2026-03-25 — Session 1
+### What works
+- Full 14B model loads successfully with LoRA (294M trainable params)
+- Forward pass through 40-block causal DiT completes on single A100
+- FlexAttention compiles and runs correctly
+- FSDP wrapping works (2-GPU)
+- All data shapes are correct
 
-**Completed:** Tasks 0-4, 5, 5b (environment, DiT port, audio modules, LoRA, bidirectional wrapper, Stage 0 verification, data precomputation)
+### What doesn't work
+- **Backward pass OOMs** on both single-GPU and 2-GPU FSDP
+- Single A100: 78.4GB used during backward (80GB total)
+- 2-GPU FSDP: 78.5GB per GPU during backward (even after sharding)
 
-**Key results:**
-- Stage 0 verification: BIT-EXACT equivalence (max_diff = 0.0) on all 3 real TalkVid samples
-- Data precomputation: 3 TalkVid samples preprocessed with correct shapes
+### Root cause analysis
+The 14B model with 80x80x21 latents (33,600 token sequence after patching) generates massive intermediate activations during the forward pass. Even with gradient checkpointing enabled, the memory is dominated by:
+1. **FSDP unsharded params** during forward (each block unsharted to full size during its forward)
+2. **FlexAttention intermediate states** (attention maps for 33,600-token sequences)
+3. **Audio cross-attention per block** (cross-attend to 32 context tokens per frame)
 
-### 2026-03-26 — Session 2 (current)
+### Attempted solutions
+1. expandable_segments=True: no effect
+2. bf16 precision (instead of fp32 FSDP): reduced from OOM to OOM at same threshold
+3. 2-GPU FSDP: sharding not effective enough (each block unsharted during compute)
 
-**Completed:** Tasks 6, 7, 9, 10, 11 (causal wrapper, dataset, methods, configs, base mods)
-
-**Task 12 (DF E2E): In progress — multiple fixes applied:**
-
-1. **Dataloader fix:** `create_infinitetalk_dataloader()` needs `data_list_path` not `data_root`
-2. **text_embeds shape:** Dataset returns `[B, 1, 512, 4096]` after collation → squeezed to `[B, 512, 4096]`
-3. **clip_features shape:** Dataset returns `[B, 1, 257, 1280]` after collation → squeezed to `[B, 257, 1280]`
-4. **Audio windowing:** Dataset provides raw `[B, 81, 12, 768]`; added 5-frame sliding window in causal forward to get `[B, 81, 5, 12, 768]`
-5. **Audio reshape:** `SingleStreamAttention` now handles 4D `[B, N_t, N_a, C]` by reshaping to `[B*N_t, N_a, C]`
-6. **triton version:** Installed triton 3.2.0 (from 3.6.0) to fix `triton_key` import error with FlexAttention
-7. **Memory:** Forward pass uses ~73GB on A100-80GB. Backward OOMs at ~79GB. Testing `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
-
-**Deviation from plan:** The plan assumed DF training would fit on a single A100-80GB. The 14B model with LoRA uses ~73GB for forward alone, leaving insufficient headroom for backward. Options:
-- `expandable_segments=True` (testing now)
-- FSDP across 2 GPUs
-- Reduce resolution (smaller latents)
-- Reduce sequence length (fewer frames)
+### Recommended next steps (for Paul)
+1. **Reduce resolution**: Try 480x480 (60x60 latent → 30x30 after patching) instead of 640x640 (80x80 → 40x40). This cuts token count by 2.25x and memory by ~4x.
+2. **FSDP activation checkpointing**: Use `apply_fsdp_checkpointing()` instead of regular gradient checkpointing — this is what the built-in Wan network does.
+3. **4-GPU FSDP**: Use 4 GPUs to shard params more aggressively.
+4. **CPU offloading**: FSDP `cpu_offload=True` to keep optimizer states on CPU.
 
 ---
 
-## Where We Are When Session Ended
+## Deviations from Plan
 
-**All code is written and committed.** The full pipeline compiles and runs:
-- Model loads 14B weights + LoRA adapters ✓
-- Dataset loads real precomputed TalkVid data ✓
-- Forward pass through 40-block causal DiT with FlexAttention ✓
-- FlexAttention triton kernel compilation succeeds ✓
-- Backward pass OOMs on single A100-80GB — needs FSDP or memory optimization
+1. **LoRA on audio_cross_attn**: Plan said "LoRA adapters + audio modules trainable". Original implementation made all 2.4B audio_cross_attn params trainable (full fine-tune). Changed to LoRA on audio_cross_attn linear layers (40M extra LoRA params) + full fine-tune AudioProjModel (74M). Total trainable: 294M.
 
-**Next steps for you:**
-1. Check if the `expandable_segments` run succeeded (or switch to 2-GPU FSDP)
-2. If FSDP needed, enable with `config.trainer.fsdp = True` in the test config
-3. Once DF training completes 20 iters, check loss values
-4. Proceed to ODE extraction script and Self-Forcing Stage 2
+2. **2-GPU FSDP required**: Plan estimated Stage 1 would fit on single GPU (~23-27GB/GPU with FSDP). Actual memory usage is much higher due to sequence length (33,600 tokens) and activation storage.
+
+3. **Audio windowing location**: Plan said windowing happens inside WanModel.forward(). Actually, 5-frame sliding window extraction happens in the inference loop BEFORE model.forward(). Our causal wrapper now applies windowing when audio is not pre-windowed (4D → 5D).
+
+4. **Shape mismatches**: Dataset provides [B, 1, seq, dim] for text_embeds and clip_features (extra dim from .pt storage). Added squeezes in the causal forward to handle both shapes.
+
+5. **triton version**: Downgraded from 3.6.0 to 3.2.0 for FlexAttention compatibility.
+
+---
+
+## Files Created/Modified (summary)
+
+### New files (19 total, ~6000+ lines)
+```
+fastgen/networks/InfiniteTalk/
+    __init__.py, wan_model.py, audio_modules.py, network.py, network_causal.py, lora.py
+fastgen/datasets/infinitetalk_dataloader.py
+fastgen/methods/infinitetalk_diffusion_forcing.py, infinitetalk_kd.py, infinitetalk_self_forcing.py
+fastgen/configs/methods/config_infinitetalk_df.py, config_infinitetalk_kd.py, config_infinitetalk_sf.py
+fastgen/configs/experiments/InfiniteTalk/__init__.py, config_df.py, config_kd.py, config_sf.py, config_df_test.py
+scripts/precompute_infinitetalk_data.py, verify_infinitetalk_equivalence.py
+```
+
+### Modified files (5 base FastGen files)
+```
+fastgen/configs/config.py              — fake_score_net field
+fastgen/methods/distribution_matching/dmd2.py  — fake_score_net check
+fastgen/methods/__init__.py            — registered InfiniteTalk classes
+fastgen/networks/noise_schedule.py     — dtype param
+.gitignore                             — test data exclusion
+```
+
+### Commits (7 total on feat/infinitetalk-adaptation)
+```
+5efa38a fix: FSDP fully_shard for ABC compatibility + bf16 precision
+4d04743 fix: LoRA on audio_cross_attn + fully_shard for FSDP
+dd69b2e fix: resolve shape mismatches for DF training
+281621b feat: add causal wrapper, training infrastructure, configs
+5989a0d feat: Stage 0 verification PASSED — bit-exact equivalence
+af50dbb feat: add data preprocessing script for TalkVid
+ceaabd1 feat: add InfiniteTalkWan bidirectional wrapper
+3ddbcf4 feat: add LoRA utilities for parameter-efficient training
+a7e4efa feat: port InfiniteTalk DiT model and audio modules
+```
