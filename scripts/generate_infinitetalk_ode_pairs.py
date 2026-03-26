@@ -458,48 +458,44 @@ def extract_ode_trajectory(
     actual_num_steps = min(num_steps, max_needed_step + 1)
 
     # Initialize from pure noise (matching InfiniteTalk's original initialization)
-    # The original uses unscaled noise: latent = torch.randn(...)
-    # For RF with shift=7.0, t_schedule[0] ≈ 1.0, so sigma ≈ 1.0
-    # and ns.latents(noise, t=1.0) ≈ noise * 1.0 anyway.
-    noise = torch.randn(1, *latent_shape, device=device, dtype=dtype)
-    x_t = noise  # raw noise, same as original pipeline
+    # CRITICAL: Original uses float32 for latent (line 548 of multitalk.py)
+    # to avoid bf16 precision loss over 40 accumulated Euler steps.
+    noise = torch.randn(1, *latent_shape, device=device, dtype=torch.float32)
+    x_t = noise
+
+    # Motion frame anchoring (matching multitalk.py lines 574-577, 711, 773):
+    # The original forces the first latent frame to stay equal to the
+    # VAE-encoded reference image at EVERY step. This is essential for I2V —
+    # without it, the reference frame drifts and the output becomes blurry.
+    # first_frame_cond is [B, 16, 21, H, W] — the VAE-encoded ref + zero padding.
+    # We extract just the first temporal frame as the anchor.
+    first_frame_cond = condition["first_frame_cond"]  # [B, 16, 21, H, W]
+    # The original encodes ONLY the reference image: vae.encode(cond_image)[0]
+    # which gives [16, 1, H, W]. Our first_frame_cond has all 21 latent frames
+    # (first is ref, rest are near-zero from zero-padded pixel input).
+    # We take [:, :, :1, :, :] to get just the ref frame latent.
+    motion_frame = first_frame_cond[:, :, :1, :, :].to(torch.float32)  # [B, 16, 1, H, W]
 
     # Collect trajectory states (including initial noisy state)
     trajectory = [x_t.clone()]
-
-    # The timestep schedule is in [0, 1) range (FastGen convention).
-    # The teacher wrapper expects t in [0, 1) and internally rescales to [0, 1000).
-    # The original InfiniteTalk Euler step uses raw velocity (flow) predictions:
-    #   noise_pred = model(x_t, t, ...)              # raw flow velocity
-    #   noise_pred = -noise_pred                      # negate (InfiniteTalk convention)
-    #   dt = (t_cur - t_next) / num_timesteps         # in [0, 1000) scale
-    #   x_t = x_t + noise_pred * dt
-    #
-    # We use the teacher wrapper with DEFAULT pred_type (flow) — no fwd_pred_type="x0".
-    # This returns the raw flow velocity v, matching the original model's output.
 
     for step_idx in range(actual_num_steps):
         t_cur = t_schedule[step_idx]
         t_next = t_schedule[step_idx + 1]
 
+        # Anchor first frame BEFORE model forward (multitalk.py line 711)
+        x_t[:, :, :1, :, :] = motion_frame
+
         # Broadcast timestep to batch dim [B=1]
         t_tensor = torch.full((1,), t_cur.item(), device=device, dtype=dtype)
 
+        # Cast to model dtype for forward, keep latent in float32
+        x_t_model = x_t.to(dtype)
+
         # --- 3-call CFG on raw flow velocity ---
-        # Call 1: Full condition (text + audio)
-        v_cond = teacher(
-            x_t, t_tensor, condition=condition,
-        )
-
-        # Call 2: Drop text (neg text + audio)
-        v_drop_text = teacher(
-            x_t, t_tensor, condition=neg_text_condition,
-        )
-
-        # Call 3: Drop both (neg text + zero audio)
-        v_uncond = teacher(
-            x_t, t_tensor, condition=neg_condition,
-        )
+        v_cond = teacher(x_t_model, t_tensor, condition=condition)
+        v_drop_text = teacher(x_t_model, t_tensor, condition=neg_text_condition)
+        v_uncond = teacher(x_t_model, t_tensor, condition=neg_condition)
 
         # Combine with 3-call CFG formula (on velocity, same as original)
         v_guided = (
@@ -509,12 +505,13 @@ def extract_ode_trajectory(
         )
 
         # --- Euler step (matching InfiniteTalk multitalk.py lines 758-763) ---
-        # Negate the velocity (InfiniteTalk convention)
-        v_guided = -v_guided
+        v_guided = -v_guided.float()  # negate + cast to float32 for accumulation
 
-        # dt in the original uses timesteps in [0, 1000] range
-        dt = (t_cur - t_next)  # already in [0, 1) range since t_schedule = timesteps / 1000
+        dt = (t_cur - t_next)  # in [0, 1) range
         x_t = x_t + v_guided * dt
+
+        # Anchor first frame AFTER Euler step (multitalk.py line 773)
+        x_t[:, :, :1, :, :] = motion_frame
 
         trajectory.append(x_t.clone())
 
