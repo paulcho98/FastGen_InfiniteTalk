@@ -534,6 +534,7 @@ def output_complete(sample_dir: str):
     required = [
         "vae_latents.pt",
         "first_frame_cond.pt",
+        "motion_frame.pt",
         "clip_features.pt",
         "audio_emb.pt",
         "text_embeds.pt",
@@ -576,8 +577,21 @@ def process_sample(
         logger.warning("  Audio not found: %s", audio_path)
         return False
 
-    target_h = resolution
-    target_w = resolution
+    # Select aspect-ratio-matched resolution bucket (matching original pipeline).
+    # The original uses ASPECT_RATIO_627 for 480p and selects the closest bucket
+    # based on the source video's height/width ratio.
+    ASPECT_RATIO_627 = {
+        '0.26': [320, 1216], '0.38': [384, 1024], '0.50': [448, 896],
+        '0.67': [512, 768],  '0.82': [576, 704],  '1.00': [640, 640],
+        '1.22': [704, 576],  '1.50': [768, 512],  '1.86': [832, 448],
+        '2.00': [896, 448],  '2.50': [960, 384],  '2.83': [1088, 384],
+        '3.60': [1152, 320], '3.80': [1216, 320],  '4.00': [1280, 320],
+    }
+    src_h = int(row.get("height", resolution))
+    src_w = int(row.get("width", resolution))
+    ratio = src_h / src_w
+    closest_bucket = sorted(ASPECT_RATIO_627.keys(), key=lambda x: abs(float(x) - ratio))[0]
+    target_h, target_w = ASPECT_RATIO_627[closest_bucket]
 
     # Per-file skip: only compute what's missing
     def _exists(name):
