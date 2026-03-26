@@ -57,6 +57,7 @@ def create_config():
         neg_text_emb_path=NEG_TEXT_EMB,
         batch_size=1,
         load_ode_path=False,
+        expected_latent_shape=config.model.input_shape,  # filter mismatched resolutions
         num_workers=0,
     )
 

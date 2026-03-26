@@ -46,6 +46,7 @@ class InfiniteTalkDataset(Dataset):
         neg_text_emb_path: str = None,
         load_ode_path: bool = False,
         num_video_frames: int = 81,
+        expected_latent_shape: tuple = None,
     ):
         """
         Args:
@@ -54,16 +55,26 @@ class InfiniteTalkDataset(Dataset):
                 If None, uses zeros [1, 512, 4096].
             load_ode_path: If True, load ode_path.pt for KD training.
             num_video_frames: Number of video frames (for audio truncation).
+            expected_latent_shape: If set, e.g. (16, 21, 56, 112), filter out samples
+                whose vae_latents.pt has a different shape. This handles datasets with
+                mixed aspect ratios — only samples matching the training resolution
+                are kept.
+
+                NOTE: For future multi-resolution training, replace this filter with
+                aspect-ratio bucketed sampling (group by resolution so each batch
+                has uniform spatial dims). The model's transformer is resolution-
+                agnostic (RoPE adapts), but noise/loss shapes must match within a batch.
         """
         self.load_ode_path = load_ode_path
         self.num_video_frames = num_video_frames
+        self.expected_latent_shape = tuple(expected_latent_shape) if expected_latent_shape else None
 
         # Read sample directories from text file
         with open(data_list_path) as f:
             all_dirs = [line.strip() for line in f if line.strip()]
 
         # Filter out samples missing required files
-        self.dirs = []
+        valid_dirs = []
         required_files = [
             "vae_latents.pt",
             "first_frame_cond.pt",
@@ -71,17 +82,41 @@ class InfiniteTalkDataset(Dataset):
             "audio_emb.pt",
             "text_embeds.pt",
         ]
+        missing_count = 0
         for d in all_dirs:
             missing = [fn for fn in required_files if not os.path.exists(os.path.join(d, fn))]
             if missing:
                 warnings.warn(f"Skipping {d}: missing {missing}")
+                missing_count += 1
             else:
-                self.dirs.append(d)
+                valid_dirs.append(d)
 
-        if len(self.dirs) < len(all_dirs):
+        # Filter by resolution if expected_latent_shape is set
+        shape_mismatch_count = 0
+        if self.expected_latent_shape is not None:
+            self.dirs = []
+            for d in valid_dirs:
+                # Quick shape check: load only metadata (mmap), don't load full tensor
+                try:
+                    lat = torch.load(os.path.join(d, "vae_latents.pt"),
+                                     map_location="cpu", weights_only=False)
+                    if isinstance(lat, dict):
+                        lat = next(v for v in lat.values() if isinstance(v, torch.Tensor))
+                    if tuple(lat.shape) == self.expected_latent_shape:
+                        self.dirs.append(d)
+                    else:
+                        shape_mismatch_count += 1
+                    del lat
+                except Exception:
+                    shape_mismatch_count += 1
+        else:
+            self.dirs = valid_dirs
+
+        skipped = missing_count + shape_mismatch_count
+        if skipped > 0:
             print(
                 f"[InfiniteTalkDataset] Kept {len(self.dirs)}/{len(all_dirs)} samples "
-                f"({len(all_dirs) - len(self.dirs)} skipped due to missing files)"
+                f"(skipped: {missing_count} missing files, {shape_mismatch_count} resolution mismatch)"
             )
 
         # Load negative text embedding (shared across all samples, for CFG)
