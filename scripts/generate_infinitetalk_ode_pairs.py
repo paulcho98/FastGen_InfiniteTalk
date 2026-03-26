@@ -813,12 +813,10 @@ def main():
                 device=device,
                 dtype=dtype,
             )
-            # trajectory: [num_subsample, C, T, H, W] — includes clean as last
-
-            # Split: noisy states (exclude clean) = ode_path
-            # The clean target (t=0.0) is the last element; training uses
-            # vae_latents.pt directly, so we exclude it from ode_path.
-            ode_path = trajectory[:-1]  # [4, 16, 21, H, W]
+            # trajectory: [num_subsample, C, T, H, W]
+            # extract_ode_trajectory already filters out t=0.0 (clean state)
+            # since the clean target is vae_latents.pt, not the ODE solve.
+            ode_path = trajectory  # [num_subsample, 16, 21, H, W]
 
             # Save to sample directory
             save_path = os.path.join(sample_dir, args.output_key)
