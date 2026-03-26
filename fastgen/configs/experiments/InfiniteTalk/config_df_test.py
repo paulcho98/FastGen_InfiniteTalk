@@ -21,8 +21,13 @@ class StdoutLoggerCallback(Callback):
 
     def on_training_step_end(self, model=None, data_batch=None, output_batch=None, loss_dict=None, iteration=None, **kwargs):
         if loss_dict:
-            loss_str = ", ".join(f"{k}={v:.6f}" for k, v in loss_dict.items() if isinstance(v, (int, float)))
-            print(f"  [iter {iteration}] {loss_str}")
+            parts = []
+            for k, v in loss_dict.items():
+                try:
+                    parts.append(f"{k}={float(v):.6f}")
+                except (TypeError, ValueError):
+                    pass
+            print(f"  [iter {iteration}] {', '.join(parts)}")
         else:
             print(f"  [iter {iteration}] (no loss_dict)")
 
