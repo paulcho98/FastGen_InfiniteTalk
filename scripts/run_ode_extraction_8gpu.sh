@@ -3,7 +3,12 @@
 # Each GPU loads the 14B teacher independently and processes a disjoint shard.
 #
 # Usage:
-#   bash scripts/run_ode_extraction_8gpu.sh
+#   bash scripts/run_ode_extraction_8gpu.sh [SAMPLE_LIST]
+#
+#   SAMPLE_LIST: Optional path to a text file listing sample directories.
+#                If not provided, auto-discovers ALL samples with vae_latents.pt.
+#                Use a fixed list to prevent processing lazily-cached samples
+#                that weren't part of the original preprocessing batch.
 #
 # Auto-detects available GPUs. Timing: ~20 min/sample per GPU.
 # With 8 GPUs and 3000 samples: 375 samples/GPU × 20 min ≈ 5.2 days.
@@ -25,11 +30,17 @@ IT_CKPT="/data/karlo-research_715/workspace/kinemaar/paul/AR_diffusion/reference
 NUM_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count())")
 echo "Detected $NUM_GPUS GPUs"
 
-# Build sample list from precomputed data directories
-SAMPLE_LIST="${DATA_DIR}/sample_list.txt"
-find "$DATA_DIR" -name "vae_latents.pt" -exec dirname {} \; | sort > "$SAMPLE_LIST"
+# Use provided sample list, or auto-discover
+SAMPLE_LIST="${1:-}"
+if [ -z "$SAMPLE_LIST" ]; then
+    SAMPLE_LIST="${DATA_DIR}/ode_sample_list.txt"
+    echo "No sample list provided — auto-discovering from $DATA_DIR"
+    find "$DATA_DIR" -name "vae_latents.pt" -exec dirname {} \; | sort > "$SAMPLE_LIST"
+else
+    echo "Using provided sample list: $SAMPLE_LIST"
+fi
 NUM_SAMPLES=$(wc -l < "$SAMPLE_LIST")
-echo "Found $NUM_SAMPLES samples with precomputed data"
+echo "Found $NUM_SAMPLES samples"
 
 torchrun --nproc_per_node=$NUM_GPUS scripts/generate_infinitetalk_ode_pairs.py \
     --data_list_path "$SAMPLE_LIST" \

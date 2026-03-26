@@ -66,3 +66,11 @@ if [ $FAIL -eq 0 ]; then
 else
     echo "WARNING: $FAIL GPU(s) failed. Check logs."
 fi
+
+# Save a snapshot of completed samples for ODE extraction.
+# This prevents ODE from picking up lazily-cached samples added later by training.
+SNAPSHOT="${OUTPUT_DIR}/precompute_sample_list.txt"
+find "$OUTPUT_DIR" -name "vae_latents.pt" -exec dirname {} \; | sort > "$SNAPSHOT"
+COMPLETED=$(wc -l < "$SNAPSHOT")
+echo "Saved sample list: $SNAPSHOT ($COMPLETED complete samples)"
+echo "Use this for ODE extraction: bash scripts/run_ode_extraction_8gpu.sh $SNAPSHOT"

@@ -19,6 +19,9 @@ Output directory: data/precomputed_talkvid/
   - Saves: text_embeds.pt + neg_text_embeds.pt per sample
   - Resumable: skips samples with existing text_embeds.pt
 
+  For ALL 172K samples (needed for lazy-cache training beyond 3000):
+    bash scripts/run_precompute_t5.sh 0
+
 ================================================================================
   STEP 2: Full Precompute — VAE, CLIP, Audio (~80 min for 3000 on 8 GPUs)
 ================================================================================
@@ -26,40 +29,76 @@ Output directory: data/precomputed_talkvid/
   bash scripts/run_precompute_8gpu.sh 3000
 
   - Auto-detects GPUs, launches one process per GPU
-  - Loads VAE + CLIP + T5 + wav2vec2 per GPU
-  - Skips text_embeds.pt if already computed in Step 1
-  - Saves per sample: vae_latents.pt, first_frame_cond.pt, clip_features.pt,
-    audio_emb.pt, text_embeds.pt
+  - Per-file skip: only recomputes missing modalities per sample
+  - Uses aspect-ratio-matched resolution (ASPECT_RATIO_627 buckets)
+  - Saves per sample: vae_latents.pt, first_frame_cond.pt, motion_frame.pt,
+    clip_features.pt, audio_emb.pt, text_embeds.pt
+  - Saves snapshot: precompute_sample_list.txt (for ODE extraction)
   - Logs: data/precomputed_talkvid/log_gpu*.txt
-  - Resumable: skips fully complete samples
 
 ================================================================================
   STEP 3: ODE Trajectory Extraction (~5 days for 3000 on 8 GPUs)
 ================================================================================
 
-  bash scripts/run_ode_extraction_8gpu.sh
+  Use the snapshot from Step 2 to process ONLY the 3000 samples:
+    bash scripts/run_ode_extraction_8gpu.sh data/precomputed_talkvid/precompute_sample_list.txt
 
-  - Auto-discovers samples from Step 2 output (finds vae_latents.pt dirs)
+  Or auto-discover ALL samples (including lazily-cached ones):
+    bash scripts/run_ode_extraction_8gpu.sh
+
   - Uses torchrun for distributed data-parallel across all GPUs
   - Each GPU loads full 14B teacher (~28GB) + runs 40-step 3-call CFG
-  - Saves: ode_path.pt per sample ([3, 16, 21, 80, 80] bf16, ~12MB each)
+  - Saves: ode_path.pt per sample ([4, 16, 21, 56, 112] bf16)
   - Resumable: --skip_existing skips samples with ode_path.pt
 
 ================================================================================
-  NOTES
+  PARALLEL PIPELINE: DF Training + ODE Extraction
 ================================================================================
 
-  - Steps 1 and 2 can be combined (Step 2 does everything), but running
-    Step 1 first enables lazy caching of T5 during training.
+  You can start DF training immediately after Step 2 (no ODE needed):
 
-  - To process ALL 172K samples instead of 3000:
-      bash scripts/run_precompute_t5.sh 0
-      bash scripts/run_precompute_8gpu.sh 0
-    (0 = all samples in CSV)
+    GPUs 0-1:  DF training
+    GPUs 2-7:  ODE extraction (using precompute_sample_list.txt)
 
-  - To use specific GPUs:
-      CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/run_precompute_t5.sh 3000
+  When ODE finishes, switch to KD training on all 8 GPUs.
 
-  - Monitor progress:
-      tail -f data/precomputed_talkvid/log_gpu0.txt   # Step 2 logs
-      ls data/precomputed_talkvid/*/ode_path.pt | wc -l  # Step 3 count
+================================================================================
+  LAZY CACHING: Expanding Beyond 3000 Samples
+================================================================================
+
+  To train on more samples than the initial 3000 without re-running
+  the full precompute:
+
+  1. Pre-compute T5 for ALL samples (one-time, ~3 hours on 8 GPUs):
+       bash scripts/run_precompute_t5.sh 0
+
+  2. Run the precompute daemon on a spare GPU:
+       CUDA_VISIBLE_DEVICES=7 bash scripts/run_precompute_daemon.sh
+
+     The daemon scans for samples with text_embeds.pt but missing
+     vae_latents.pt, and fills in VAE/CLIP/audio. It runs continuously
+     until you Ctrl+C.
+
+  3. The dataloader's expected_latent_shape filter ensures only samples
+     with matching resolution are used for training.
+
+  IMPORTANT: Use precompute_sample_list.txt for ODE extraction so it
+  only processes the explicitly precomputed batch, not lazily-cached
+  samples which may still be incomplete.
+
+================================================================================
+  RESOLUTION
+================================================================================
+
+  The precompute script auto-selects resolution from ASPECT_RATIO_627
+  based on each video's aspect ratio. TalkVid is 99.3% 16:9 -> [448, 896].
+  Training input_shape is [16, 21, 56, 112]. The dataloader filters out
+  samples with non-matching resolution (~0.7% of TalkVid).
+
+================================================================================
+  MONITORING
+================================================================================
+
+  tail -f data/precomputed_talkvid/log_gpu0.txt                 # Step 2 logs
+  find data/precomputed_talkvid -name ode_path.pt | wc -l       # ODE count
+  find data/precomputed_talkvid -name vae_latents.pt | wc -l    # Precompute count
