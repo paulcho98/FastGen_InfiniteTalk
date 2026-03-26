@@ -565,60 +565,87 @@ def process_sample(
     target_h = resolution
     target_w = resolution
 
-    # ---- Load video ----
-    frames, fps = load_video_frames(video_path, frame_count)
-    actual_frames = frames.shape[0]
-    if actual_frames < frame_count:
-        logger.warning(
-            "  Video has %d frames (need %d), zero-padding", actual_frames, frame_count)
-        pad = np.zeros(
-            (frame_count - actual_frames, frames.shape[1], frames.shape[2], 3),
-            dtype=frames.dtype)
-        frames = np.concatenate([frames, pad], axis=0)
+    # Per-file skip: only compute what's missing
+    def _exists(name):
+        return os.path.isfile(os.path.join(sample_dir, name))
 
-    video_tensor = resize_and_center_crop(frames, target_h, target_w)
-    # video_tensor: [3, T, H, W] float32 in [-1, 1]
+    need_vae = not _exists("vae_latents.pt")
+    need_ffc = not _exists("first_frame_cond.pt")
+    need_clip = not _exists("clip_features.pt")
+    need_t5 = not _exists("text_embeds.pt")
+    need_audio = not _exists("audio_emb.pt")
 
-    # ---- Extract first frame as PIL and apply original preprocessing ----
-    # The original pipeline (multitalk.py) uses PIL BILINEAR resize + center_crop
-    # for the reference frame. This is used by CLIP and VAE first_frame_cond.
-    from PIL import Image
-    first_frame_pil = Image.fromarray(frames[0])  # [H, W, 3] uint8 → PIL
-    cond_image = resize_and_centercrop_pil(first_frame_pil, target_h, target_w)
-    # cond_image: [1, C, 1, H, W] float32 in [-1, 1]
+    # Video loading + PIL first frame needed for VAE, first_frame_cond, or CLIP
+    need_video = need_vae or need_ffc or need_clip
+    video_tensor = None
+    cond_image = None
+
+    if need_video:
+        frames, fps = load_video_frames(video_path, frame_count)
+        actual_frames = frames.shape[0]
+        if actual_frames < frame_count:
+            logger.warning(
+                "  Video has %d frames (need %d), zero-padding", actual_frames, frame_count)
+            pad = np.zeros(
+                (frame_count - actual_frames, frames.shape[1], frames.shape[2], 3),
+                dtype=frames.dtype)
+            frames = np.concatenate([frames, pad], axis=0)
+
+        video_tensor = resize_and_center_crop(frames, target_h, target_w)
+        # video_tensor: [3, T, H, W] float32 in [-1, 1]
+
+        # Extract first frame as PIL and apply original preprocessing
+        from PIL import Image
+        first_frame_pil = Image.fromarray(frames[0])  # [H, W, 3] uint8 → PIL
+        cond_image = resize_and_centercrop_pil(first_frame_pil, target_h, target_w)
+        # cond_image: [1, C, 1, H, W] float32 in [-1, 1]
 
     # ---- VAE encode ----
-    logger.info("  Encoding VAE...")
-    latents, first_frame_cond = encode_vae(
-        vae, video_tensor, device, cond_image=cond_image)
-    torch.save(latents, os.path.join(sample_dir, "vae_latents.pt"))
-    torch.save(first_frame_cond, os.path.join(sample_dir, "first_frame_cond.pt"))
-    del latents, first_frame_cond
-    torch.cuda.empty_cache()
+    if need_vae or need_ffc:
+        logger.info("  Encoding VAE...")
+        latents, first_frame_cond = encode_vae(
+            vae, video_tensor, device, cond_image=cond_image)
+        if need_vae:
+            torch.save(latents, os.path.join(sample_dir, "vae_latents.pt"))
+        if need_ffc:
+            torch.save(first_frame_cond, os.path.join(sample_dir, "first_frame_cond.pt"))
+        del latents, first_frame_cond
+        torch.cuda.empty_cache()
+    else:
+        logger.info("  Skipping VAE (exists)")
 
     # ---- CLIP encode ----
-    logger.info("  Encoding CLIP...")
-    clip_features = encode_clip(clip_model, device, cond_image=cond_image)
-    torch.save(clip_features, os.path.join(sample_dir, "clip_features.pt"))
-    del clip_features
-    torch.cuda.empty_cache()
+    if need_clip:
+        logger.info("  Encoding CLIP...")
+        clip_features = encode_clip(clip_model, device, cond_image=cond_image)
+        torch.save(clip_features, os.path.join(sample_dir, "clip_features.pt"))
+        del clip_features
+        torch.cuda.empty_cache()
+    else:
+        logger.info("  Skipping CLIP (exists)")
 
     # ---- T5 encode ----
-    logger.info("  Encoding T5...")
-    text_embeds = encode_t5(t5_encoder, text, device)
-    torch.save(text_embeds, os.path.join(sample_dir, "text_embeds.pt"))
-    del text_embeds
-    torch.cuda.empty_cache()
+    if need_t5:
+        logger.info("  Encoding T5...")
+        text_embeds = encode_t5(t5_encoder, text, device)
+        torch.save(text_embeds, os.path.join(sample_dir, "text_embeds.pt"))
+        del text_embeds
+        torch.cuda.empty_cache()
+    else:
+        logger.info("  Skipping T5 (exists)")
 
     # ---- Audio encode ----
-    logger.info("  Encoding audio (wav2vec2)...")
-    audio_array = load_audio_array(audio_path)
-    audio_emb = encode_audio(
-        wav2vec_fe, audio_encoder, audio_array,
-        num_video_frames=frame_count, device=device)
-    torch.save(audio_emb, os.path.join(sample_dir, "audio_emb.pt"))
-    del audio_emb, audio_array
-    torch.cuda.empty_cache()
+    if need_audio:
+        logger.info("  Encoding audio (wav2vec2)...")
+        audio_array = load_audio_array(audio_path)
+        audio_emb = encode_audio(
+            wav2vec_fe, audio_encoder, audio_array,
+            num_video_frames=frame_count, device=device)
+        torch.save(audio_emb, os.path.join(sample_dir, "audio_emb.pt"))
+        del audio_emb, audio_array
+        torch.cuda.empty_cache()
+    else:
+        logger.info("  Skipping audio (exists)")
 
     return True
 
