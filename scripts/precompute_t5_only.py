@@ -22,10 +22,15 @@ Timing: ~0.5s/sample. 172K samples on 8 GPUs ≈ 3 hours.
 
 import argparse
 import csv
+import inspect
 import logging
 import os
 import sys
 import time
+
+# Python 3.12: inspect.ArgSpec was removed
+if not hasattr(inspect, 'ArgSpec'):
+    inspect.ArgSpec = inspect.FullArgSpec
 import torch
 import torch.multiprocessing as mp
 
@@ -94,6 +99,10 @@ def _add_infinitetalk_to_path():
 
 def worker(gpu_id, rows, args):
     """Worker process for one GPU."""
+    import inspect
+    if not hasattr(inspect, 'ArgSpec'):
+        inspect.ArgSpec = inspect.FullArgSpec
+
     device = f"cuda:{gpu_id}"
     torch.cuda.set_device(gpu_id)
 
