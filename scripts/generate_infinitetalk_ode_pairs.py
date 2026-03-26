@@ -249,6 +249,12 @@ def load_sample(
             os.path.join(sample_dir, "first_frame_cond.pt"), dtype
         )  # [16, 21, H, W]
 
+        # --- Motion frame (single-frame VAE encode for anchoring) ---
+        motion_frame_path = os.path.join(sample_dir, "motion_frame.pt")
+        motion_frame = None
+        if os.path.isfile(motion_frame_path):
+            motion_frame = _load_tensor(motion_frame_path, dtype)  # [16, 1, H, W]
+
         # --- CLIP features ---
         clip_features = _load_tensor(
             os.path.join(sample_dir, "clip_features.pt"), dtype
@@ -287,6 +293,8 @@ def load_sample(
             "clip_features": clip_features.to(device),                # [1, 257, 1280]
             "audio_emb": audio_emb.unsqueeze(0).to(device),           # [1, 81, 5, 12, 768]
         }
+        if motion_frame is not None:
+            condition["motion_frame"] = motion_frame.unsqueeze(0).to(device)  # [1, 16, 1, H, W]
 
         # Negative text embedding for CFG
         neg_text = neg_text_embeds.to(device=device, dtype=dtype)
@@ -467,14 +475,20 @@ def extract_ode_trajectory(
     # The original forces the first latent frame to stay equal to the
     # VAE-encoded reference image at EVERY step. This is essential for I2V —
     # without it, the reference frame drifts and the output becomes blurry.
-    # first_frame_cond is [B, 16, 21, H, W] — the VAE-encoded ref + zero padding.
-    # We extract just the first temporal frame as the anchor.
-    first_frame_cond = condition["first_frame_cond"]  # [B, 16, 21, H, W]
-    # The original encodes ONLY the reference image: vae.encode(cond_image)[0]
-    # which gives [16, 1, H, W]. Our first_frame_cond has all 21 latent frames
-    # (first is ref, rest are near-zero from zero-padded pixel input).
-    # We take [:, :, :1, :, :] to get just the ref frame latent.
-    motion_frame = first_frame_cond[:, :, :1, :, :].to(torch.float32)  # [B, 16, 1, H, W]
+    #
+    # CRITICAL: The motion anchor must be from vae.encode(single_ref_image),
+    # NOT from first_frame_cond[:, :, :1]. The VAE's temporal convolutions
+    # produce DIFFERENT values when encoding a single frame vs the first frame
+    # of a 81-frame sequence (even if the rest is zero-padded).
+    #
+    # motion_frame.pt is precomputed separately as vae.encode(cond_image)[0].
+    # Fallback: use first_frame_cond[:, :, :1] (less accurate but functional).
+    if "motion_frame" in condition:
+        motion_frame = condition["motion_frame"].to(torch.float32)  # [B, 16, 1, H, W]
+    else:
+        # Fallback: slice from first_frame_cond (not ideal — temporal conv bleed)
+        first_frame_cond = condition["first_frame_cond"]
+        motion_frame = first_frame_cond[:, :, :1, :, :].to(torch.float32)
 
     # Collect trajectory states (including initial noisy state)
     trajectory = [x_t.clone()]

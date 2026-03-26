@@ -412,7 +412,21 @@ def encode_vae(vae, video_tensor, device, cond_image=None):
         first_frame_cond = vae.encode([first_frame_padded])
         first_frame_cond = first_frame_cond[0].cpu()
 
-    return latents, first_frame_cond
+    # Also encode ONLY the reference image (no temporal context) for motion anchoring.
+    # Original: latent_motion_frames = self.vae.encode(cond_image)[0]
+    # cond_image is [1, C, 1, H, W] — a single frame, not padded.
+    # This produces a different latent than first_frame_cond[:, :1] because the
+    # VAE's temporal convolutions don't see the zero padding.
+    if cond_image is not None:
+        motion_frame = vae.encode(cond_image_dev)
+        motion_frame = torch.stack(motion_frame).to(torch.bfloat16)[0].cpu()
+        # motion_frame: [16, 1, H, W] — single latent frame, no temporal context
+    else:
+        single_frame = video[:, :1, :, :].unsqueeze(0).to(device)  # [1, C, 1, H, W]
+        motion_frame = vae.encode(single_frame)
+        motion_frame = torch.stack(motion_frame)[0].cpu()
+
+    return latents, first_frame_cond, motion_frame
 
 
 @torch.no_grad()
@@ -601,15 +615,18 @@ def process_sample(
         # cond_image: [1, C, 1, H, W] float32 in [-1, 1]
 
     # ---- VAE encode ----
-    if need_vae or need_ffc:
+    need_motion = not _exists("motion_frame.pt")
+    if need_vae or need_ffc or need_motion:
         logger.info("  Encoding VAE...")
-        latents, first_frame_cond = encode_vae(
+        latents, first_frame_cond, motion_frame = encode_vae(
             vae, video_tensor, device, cond_image=cond_image)
         if need_vae:
             torch.save(latents, os.path.join(sample_dir, "vae_latents.pt"))
         if need_ffc:
             torch.save(first_frame_cond, os.path.join(sample_dir, "first_frame_cond.pt"))
-        del latents, first_frame_cond
+        if need_motion:
+            torch.save(motion_frame, os.path.join(sample_dir, "motion_frame.pt"))
+        del latents, first_frame_cond, motion_frame
         torch.cuda.empty_cache()
     else:
         logger.info("  Skipping VAE (exists)")
