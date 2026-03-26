@@ -19,10 +19,12 @@ from fastgen.callbacks.callback import Callback
 class StdoutLoggerCallback(Callback):
     """Simple callback that prints loss to stdout at each training step."""
 
-    def on_training_step_end(self, model=None, data_batch=None, output_batch=None, losses=None, iteration=None, **kwargs):
-        if losses:
-            loss_str = ", ".join(f"{k}={v:.6f}" for k, v in losses.items() if isinstance(v, (int, float)))
+    def on_training_step_end(self, model=None, data_batch=None, output_batch=None, loss_dict=None, iteration=None, **kwargs):
+        if loss_dict:
+            loss_str = ", ".join(f"{k}={v:.6f}" for k, v in loss_dict.items() if isinstance(v, (int, float)))
             print(f"  [iter {iteration}] {loss_str}")
+        else:
+            print(f"  [iter {iteration}] (no loss_dict)")
 
 
 def create_config():
