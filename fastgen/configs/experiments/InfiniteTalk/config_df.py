@@ -48,8 +48,9 @@ def create_config():
     config.model.precision = "bfloat16"
     config.model.precision_fsdp = "bfloat16"
 
-    # Input shape: 640x640 @ 81 frames -> latent [16, 21, 80, 80]
-    config.model.input_shape = [16, 21, 80, 80]
+    # Input shape: 448x896 @ 81 frames -> latent [16, 21, 56, 112]
+    # (Most TalkVid videos are 16:9, bucket [448, 896] from ASPECT_RATIO_627)
+    config.model.input_shape = [16, 21, 56, 112]
 
     # Student network
     config.model.net = CausalInfiniteTalk_14B_Student

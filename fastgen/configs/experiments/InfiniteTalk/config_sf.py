@@ -90,8 +90,8 @@ def create_config():
     config.model.precision = "bfloat16"
     config.model.precision_fsdp = "float32"
 
-    # Input shape: 640x640 @ 81 frames -> latent [16, 21, 80, 80]
-    config.model.input_shape = [16, 21, 80, 80]
+    # Input shape: 448x896 @ 81 frames -> latent [16, 21, 56, 112]
+    config.model.input_shape = [16, 21, 56, 112]
     config.model.fake_score_pred_type = "x0"
 
     # 3-call CFG with separate text and audio guidance scales
