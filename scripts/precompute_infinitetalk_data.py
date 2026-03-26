@@ -458,20 +458,37 @@ def encode_clip(clip_model, device, cond_image=None, video_tensor=None):
 def encode_t5(t5_encoder, text: str, device):
     """Encode text through T5 UMT5-XXL.
 
-    Returns the FULL padded embedding (not trimmed to actual token length)
-    so it can be loaded directly during training.
+    Returns a ZERO-PADDED embedding [1, 512, 4096] where positions beyond
+    the actual token length are filled with ZEROS (not T5 transformer output).
+
+    This matches the original pipeline: T5EncoderModel.__call__() returns
+    trimmed embeddings, then WanModel.forward() zero-pads at lines 641-646
+    of multitalk_model.py. We replicate this zero-padding here so the saved
+    tensor is ready to use.
+
+    CRITICAL: The previous version saved raw T5 output which has NON-ZERO
+    values at padding positions. The original uses ZEROS there. This caused
+    text cross-attention to see different conditioning, producing blurry output.
 
     Returns:
-        text_embeds: [1, 512, 4096]
+        text_embeds: [1, 512, 4096] (zero-padded to text_len)
     """
-    # T5EncoderModel.__call__ returns a list of trimmed tensors.
-    # We call the underlying model directly to get the padded version.
-    ids, mask = t5_encoder.tokenizer(
-        [text], return_mask=True, add_special_tokens=True)
-    ids = ids.to(device)
-    mask = mask.to(device)
-    context = t5_encoder.model(ids, mask)  # [1, 512, 4096]
-    return context.float().cpu()
+    # Get trimmed embedding (matching original T5EncoderModel.__call__)
+    t5_encoder.model.to(device)
+    result = t5_encoder([text], device)  # list of [seq_len, 4096]
+    trimmed = result[0]  # [seq_len, 4096]
+    t5_encoder.model.cpu()
+
+    # Zero-pad to text_len=512 (matching WanModel.forward() lines 641-646)
+    seq_len, dim = trimmed.shape
+    text_len = 512
+    if seq_len < text_len:
+        padding = trimmed.new_zeros(text_len - seq_len, dim)
+        padded = torch.cat([trimmed, padding], dim=0)
+    else:
+        padded = trimmed[:text_len]
+
+    return padded.float().cpu().unsqueeze(0)  # [1, 512, 4096]
 
 
 @torch.no_grad()

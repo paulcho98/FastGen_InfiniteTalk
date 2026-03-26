@@ -136,15 +136,23 @@ def worker(gpu_id, rows, args):
         os.makedirs(sample_dir, exist_ok=True)
 
         try:
+            # Use T5EncoderModel.__call__ to get TRIMMED embedding,
+            # then zero-pad to 512 (matching original pipeline's behavior
+            # where WanModel.forward() zero-pads at lines 641-646).
             t5_encoder.model.to(device)
-            ids, mask = t5_encoder.tokenizer(
-                [text], return_mask=True, add_special_tokens=True)
-            ids = ids.to(device)
-            mask = mask.to(device)
             with torch.no_grad():
-                context = t5_encoder.model(ids, mask)
-            torch.save(context.float().cpu(), text_path)
+                result = t5_encoder([text], device)  # list of [seq_len, 4096]
+            trimmed = result[0]  # [seq_len, 4096]
             t5_encoder.model.cpu()
+
+            seq_len, dim = trimmed.shape
+            text_len = 512
+            if seq_len < text_len:
+                padding = trimmed.new_zeros(text_len - seq_len, dim)
+                padded = torch.cat([trimmed, padding], dim=0)
+            else:
+                padded = trimmed[:text_len]
+            torch.save(padded.float().cpu().unsqueeze(0), text_path)  # [1, 512, 4096]
             success += 1
         except Exception as e:
             logger.error("GPU %d: Failed %s: %s", gpu_id, sample_name, e)
@@ -197,10 +205,13 @@ def main():
             tokenizer_path=os.path.join(args.weights_dir, "google", "umt5-xxl"),
         )
         t5.model.to("cuda:0")
-        ids, mask = t5.tokenizer([args.neg_prompt], return_mask=True, add_special_tokens=True)
         with torch.no_grad():
-            neg = t5.model(ids.to("cuda:0"), mask.to("cuda:0"))
-        torch.save(neg.float().cpu(), neg_path)
+            result = t5([args.neg_prompt], torch.device("cuda:0"))
+        trimmed = result[0]  # [seq_len, 4096]
+        seq_len, dim = trimmed.shape
+        if seq_len < 512:
+            trimmed = torch.cat([trimmed, trimmed.new_zeros(512 - seq_len, dim)], dim=0)
+        torch.save(trimmed[:512].float().cpu().unsqueeze(0), neg_path)  # [1, 512, 4096]
         del t5
         torch.cuda.empty_cache()
         logger.info("Saved neg_text_embeds.pt")
