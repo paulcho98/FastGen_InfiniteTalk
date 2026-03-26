@@ -1,0 +1,65 @@
+================================================================================
+  InfiniteTalk Data Processing Pipeline — Run Instructions
+================================================================================
+
+All commands run from:
+  cd /data/karlo-research_715/workspace/kinemaar/paul/AR_diffusion/reference_FastGen_InfiniteTalk/FastGen_InfiniteTalk
+
+All scripts auto-detect available GPUs. All are resumable (skip existing).
+Output directory: data/precomputed_talkvid/
+
+================================================================================
+  STEP 1: T5 Text Embeddings (~3 min for 3000 samples on 8 GPUs)
+================================================================================
+
+  bash scripts/run_precompute_t5.sh 3000
+
+  - Auto-detects GPUs, distributes evenly via multiprocessing
+  - Only loads T5 (~20GB), lightweight
+  - Saves: text_embeds.pt + neg_text_embeds.pt per sample
+  - Resumable: skips samples with existing text_embeds.pt
+
+================================================================================
+  STEP 2: Full Precompute — VAE, CLIP, Audio (~80 min for 3000 on 8 GPUs)
+================================================================================
+
+  bash scripts/run_precompute_8gpu.sh 3000
+
+  - Auto-detects GPUs, launches one process per GPU
+  - Loads VAE + CLIP + T5 + wav2vec2 per GPU
+  - Skips text_embeds.pt if already computed in Step 1
+  - Saves per sample: vae_latents.pt, first_frame_cond.pt, clip_features.pt,
+    audio_emb.pt, text_embeds.pt
+  - Logs: data/precomputed_talkvid/log_gpu*.txt
+  - Resumable: skips fully complete samples
+
+================================================================================
+  STEP 3: ODE Trajectory Extraction (~5 days for 3000 on 8 GPUs)
+================================================================================
+
+  bash scripts/run_ode_extraction_8gpu.sh
+
+  - Auto-discovers samples from Step 2 output (finds vae_latents.pt dirs)
+  - Uses torchrun for distributed data-parallel across all GPUs
+  - Each GPU loads full 14B teacher (~28GB) + runs 40-step 3-call CFG
+  - Saves: ode_path.pt per sample ([3, 16, 21, 80, 80] bf16, ~12MB each)
+  - Resumable: --skip_existing skips samples with ode_path.pt
+
+================================================================================
+  NOTES
+================================================================================
+
+  - Steps 1 and 2 can be combined (Step 2 does everything), but running
+    Step 1 first enables lazy caching of T5 during training.
+
+  - To process ALL 172K samples instead of 3000:
+      bash scripts/run_precompute_t5.sh 0
+      bash scripts/run_precompute_8gpu.sh 0
+    (0 = all samples in CSV)
+
+  - To use specific GPUs:
+      CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/run_precompute_t5.sh 3000
+
+  - Monitor progress:
+      tail -f data/precomputed_talkvid/log_gpu0.txt   # Step 2 logs
+      ls data/precomputed_talkvid/*/ode_path.pt | wc -l  # Step 3 count

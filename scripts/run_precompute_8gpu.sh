@@ -11,7 +11,8 @@
 set -e
 
 NUM_SAMPLES=${1:-3000}
-NUM_GPUS=8
+NUM_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count())")
+echo "Detected $NUM_GPUS GPUs"
 SHARD_SIZE=$(( (NUM_SAMPLES + NUM_GPUS - 1) / NUM_GPUS ))  # ceiling division
 
 CSV_PATH="/data/karlo-research_715/workspace/kinemaar/paul/datasets/TalkVid/video_list.csv"
