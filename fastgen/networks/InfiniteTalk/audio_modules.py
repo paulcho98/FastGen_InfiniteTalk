@@ -7,7 +7,8 @@ Source files:
 
 Changes from source:
   - Removed ModelMixin/ConfigMixin inheritance and @register_to_config decorator
-  - Replaced xformers.ops.memory_efficient_attention with torch SDPA
+  - Replaced xformers.ops.memory_efficient_attention with flash_attn.flash_attn_func
+    (xformers not available; flash_attn uses same [B,S,H,D] layout and equivalent kernels)
   - Removed sequence-parallel (xfuser) codepaths
   - Stripped multi-speaker logic (lives in SingleStreamMutiAttention, not ported)
 """
@@ -192,14 +193,21 @@ class SingleStreamAttention(nn.Module):
         if self.qk_norm:
             encoder_k = self.add_k_norm(encoder_k)
 
-        # Cross-attention via SDPA
-        # q:         (B, H, N,   D)
-        # encoder_k: (B, H, N_a, D)
-        # encoder_v: (B, H, N_a, D)
-        x = torch.nn.functional.scaled_dot_product_attention(
-            q, encoder_k, encoder_v, dropout_p=self.attn_drop.p if self.training else 0.0
+        # Cross-attention via flash_attn (matching original's xformers layout)
+        # Original uses xformers.ops.memory_efficient_attention with [B, M, H, K] layout.
+        # flash_attn_func uses the same [B, S, H, D] layout.
+        # Rearrange from [B, H, M, K] to [B, M, H, K] for flash_attn_func.
+        q = rearrange(q, "B H M K -> B M H K")
+        encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
+        encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
+
+        from flash_attn import flash_attn_func
+        # No dropout in attention (matching original xformers call which has no dropout_p)
+        x = flash_attn_func(
+            q.to(encoder_v.dtype), encoder_k, encoder_v,
         )
-        # x: (B, H, N, D)
+        # x: (B, M, H, K) — same as xformers output layout
+        x = rearrange(x, "B M H K -> B H M K")
 
         # Linear transform
         x_output_shape = (B, N, C)

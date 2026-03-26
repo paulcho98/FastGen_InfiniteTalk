@@ -155,10 +155,11 @@ def _flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
             max_seqlen_q=lq, max_seqlen_k=lk,
         ).unflatten(0, (b, lq)).type(out_dtype)
     else:
-        # Fallback: scaled dot-product attention
+        # Fallback: scaled dot-product attention (only reached if flash_attn is unavailable)
         q_t = q.transpose(1, 2).to(torch.bfloat16)
         k_t = k.transpose(1, 2).to(torch.bfloat16)
         v_t = v.transpose(1, 2).to(torch.bfloat16)
+        # Note: KV-cache path is not causal (attending to cached past + current chunk)
         out = F.scaled_dot_product_attention(q_t, k_t, v_t)
         return out.transpose(1, 2).contiguous().type(out_dtype)
 

@@ -247,12 +247,13 @@ def _install_mocks():
             return None
 
     def _memory_efficient_attention(q, k, v, attn_bias=None, op=None):
-        """Drop-in for xformers MEA. Input: (B, M, H, K) -> (B, M, H, K)."""
-        q2 = q.transpose(1, 2)  # (B, H, M, K)
-        k2 = k.transpose(1, 2)
-        v2 = v.transpose(1, 2)
-        out = F.scaled_dot_product_attention(q2, k2, v2)
-        return out.transpose(1, 2)
+        """Drop-in for xformers MEA using flash_attn_func.
+        Input: (B, M, H, K) -> (B, M, H, K).
+        flash_attn_func uses the same [B, S, H, D] layout as xformers,
+        providing numerically closer results than SDPA.
+        """
+        from flash_attn import flash_attn_func
+        return flash_attn_func(q, k, v)
 
     sys.modules["xformers.ops.fmha.attn_bias"].BlockDiagonalMask = _MockBlockDiag
     sys.modules["xformers.ops.fmha"].attn_bias = sys.modules["xformers.ops.fmha.attn_bias"]

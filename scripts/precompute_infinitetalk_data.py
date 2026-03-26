@@ -156,36 +156,10 @@ def load_clip(weights_dir: str, device: str):
     """Load CLIP ViT-H/14 visual encoder.
 
     The CLIPModel class relies on ``flash_attention`` from
-    ``wan.modules.attention``, which in turn imports xfuser/xformers at
-    module level.  To avoid pulling in those heavy (and possibly absent)
-    dependencies we monkey-patch ``flash_attention`` with a pure-PyTorch
-    SDPA fallback *before* the import.
+    ``wan.modules.attention``, which uses flash_attn (available in this env).
+    No monkey-patching needed — the original flash_attention function is used
+    directly for exact numerical match with the InfiniteTalk pipeline.
     """
-    import wan.modules.attention as attn_mod
-
-    # ----- SDPA fallback for flash_attention -----
-    _original_flash = getattr(attn_mod, "flash_attention", None)
-
-    def _sdpa_flash_attention(
-        q, k, v,
-        q_lens=None, k_lens=None,
-        dropout_p=0., softmax_scale=None, q_scale=None,
-        causal=False, window_size=(-1, -1),
-        deterministic=False, dtype=torch.bfloat16, version=None,
-    ):
-        # q: [B, Lq, Nq, C], k: [B, Lk, Nk, C], v: [B, Lk, Nk, C]
-        # Transpose to [B, N, L, C] for SDPA
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        if q_scale is not None:
-            q = q * q_scale
-        out = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=dropout_p, is_causal=causal)
-        return out.transpose(1, 2)  # back to [B, L, N, C]
-
-    attn_mod.flash_attention = _sdpa_flash_attention
-
     from wan.modules.clip import CLIPModel
 
     clip_ckpt = os.path.join(
@@ -296,6 +270,11 @@ def load_video_frames(video_path: str, frame_count: int = 81):
 def resize_and_center_crop(frames: np.ndarray, target_h: int, target_w: int):
     """Resize + center-crop a batch of frames to (target_h, target_w).
 
+    Uses torch.nn.functional.interpolate (bilinear) for batch processing.
+    Note: For the FIRST frame used as conditioning (CLIP + VAE first_frame_cond),
+    use resize_and_centercrop_pil() instead — it matches the original pipeline
+    exactly (PIL BILINEAR resize → numpy → torch → torchvision center_crop).
+
     Args:
         frames: [T, H, W, 3] uint8
     Returns:
@@ -329,6 +308,45 @@ def resize_and_center_crop(frames: np.ndarray, target_h: int, target_w: int):
     return t_tensor
 
 
+def resize_and_centercrop_pil(pil_image, target_h: int, target_w: int):
+    """Resize + center-crop a PIL Image to (target_h, target_w).
+
+    This matches the EXACT preprocessing from InfiniteTalk's multitalk.py
+    resize_and_centercrop() function (PIL path): PIL BILINEAR resize,
+    numpy → torch, torchvision center_crop, resulting in [1, C, 1, H, W].
+
+    The result is normalized to [-1, 1].
+
+    Args:
+        pil_image: PIL Image (RGB)
+        target_h, target_w: target spatial dimensions
+
+    Returns:
+        tensor: [1, C, 1, target_h, target_w] float32 in [-1, 1]
+    """
+    from PIL import Image
+    import torchvision.transforms as transforms
+
+    orig_h, orig_w = pil_image.height, pil_image.width
+    scale_h = target_h / orig_h
+    scale_w = target_w / orig_w
+    scale = max(scale_h, scale_w)
+    final_h = math.ceil(scale * orig_h)
+    final_w = math.ceil(scale * orig_w)
+
+    resized_image = pil_image.resize((final_w, final_h), resample=Image.BILINEAR)
+    resized_image = np.array(resized_image)
+    resized_tensor = torch.from_numpy(resized_image)[None, ...].permute(0, 3, 1, 2).contiguous()
+    cropped_tensor = transforms.functional.center_crop(resized_tensor, (target_h, target_w))
+    cropped_tensor = cropped_tensor[:, :, None, :, :]  # [1, C, 1, H, W]
+
+    # Normalize to [-1, 1]
+    cropped_tensor = cropped_tensor.float() / 255.0
+    cropped_tensor = (cropped_tensor - 0.5) * 2.0
+
+    return cropped_tensor
+
+
 def load_audio_array(audio_path: str, sample_rate: int = 16000):
     """Load audio waveform as 1-D numpy float array at *sample_rate*."""
     import librosa
@@ -348,11 +366,14 @@ def load_audio_array(audio_path: str, sample_rate: int = 16000):
 # ===================================================================
 
 @torch.no_grad()
-def encode_vae(vae, video_tensor, device):
+def encode_vae(vae, video_tensor, device, cond_image=None):
     """Encode a full video and the first-frame condition through the VAE.
 
     Args:
         video_tensor: [C, T, H, W] float32, values in [-1, 1]
+        cond_image:   [1, C, 1, H, W] float32, values in [-1, 1]
+                      PIL-processed first frame (from resize_and_centercrop_pil).
+                      If None, falls back to using video_tensor[:, :1].
 
     Returns:
         latents:            [C_lat, T_lat, H_lat, W_lat]
@@ -364,32 +385,58 @@ def encode_vae(vae, video_tensor, device):
     latents = vae.encode([video])  # list of [C_lat, T_lat, H_lat, W_lat]
     latents = latents[0].cpu()
 
-    # First-frame condition: first frame + zero padding (same as pipeline)
+    # First-frame condition: first frame + zero padding (same as original pipeline)
+    # Original: torch.concat([cond_image, video_frames], dim=2) where cond_image
+    # is [1, C, 1, H, W] from PIL-based resize_and_centercrop
     c, t, h, w = video.shape
-    first_frame = video[:, :1, :, :]  # [C, 1, H, W]
-    padding = torch.zeros(c, t - 1, h, w, device=device)
-    first_frame_padded = torch.cat([first_frame, padding], dim=1)  # [C, T, H, W]
-    first_frame_cond = vae.encode([first_frame_padded])
-    first_frame_cond = first_frame_cond[0].cpu()
+    if cond_image is not None:
+        # Use the PIL-processed first frame (matches original exactly)
+        cond_image_dev = cond_image.to(device)  # [1, C, 1, H, W]
+        # t is the number of pixel frames (e.g. 81)
+        # Original: zeros(1, C, frame_num - 1, H, W) where frame_num = t = 81
+        zero_padding = torch.zeros(
+            1, cond_image_dev.shape[1], t - 1,
+            h, w, device=device
+        )
+        first_frame_padded = torch.cat(
+            [cond_image_dev, zero_padding], dim=2
+        )  # [1, C, t, H, W]
+        first_frame_cond = vae.encode(first_frame_padded)
+        # Original casts to param_dtype=bfloat16: y = torch.stack(y).to(self.param_dtype)
+        first_frame_cond = torch.stack(first_frame_cond).to(torch.bfloat16)[0].cpu()
+    else:
+        # Fallback: use video_tensor's first frame
+        first_frame = video[:, :1, :, :]  # [C, 1, H, W]
+        padding = torch.zeros(c, t - 1, h, w, device=device)
+        first_frame_padded = torch.cat([first_frame, padding], dim=1)  # [C, T, H, W]
+        first_frame_cond = vae.encode([first_frame_padded])
+        first_frame_cond = first_frame_cond[0].cpu()
 
     return latents, first_frame_cond
 
 
 @torch.no_grad()
-def encode_clip(clip_model, video_tensor, device):
+def encode_clip(clip_model, device, cond_image=None, video_tensor=None):
     """Extract CLIP visual features from the first frame.
 
     Args:
-        video_tensor: [C, T, H, W] float32 in [-1, 1]
+        cond_image:   [1, C, 1, H, W] float32 in [-1, 1]
+                      PIL-processed first frame (from resize_and_centercrop_pil).
+                      If None, falls back to using video_tensor.
+        video_tensor: [C, T, H, W] float32 in [-1, 1] (fallback)
 
     Returns:
         clip_features: [1, 257, 1280]  (CLS + 256 patches from ViT-H/14)
     """
-    # The pipeline calls: clip.visual(cond_image[:, :, -1:, :, :])
-    # cond_image is [1, C, 1, H, W] -- the reference frame.
-    # CLIPModel.visual expects a list of [C, T, H, W] tensors.
-    first_frame = video_tensor[:, :1, :, :].unsqueeze(0).to(device)  # [1, C, 1, H, W]
+    # Original pipeline: clip.visual(cond_image[:, :, -1:, :, :])
+    # cond_image is [1, C, 1, H, W] from PIL resize_and_centercrop
+    if cond_image is not None:
+        first_frame = cond_image[:, :, -1:, :, :].to(device)  # [1, C, 1, H, W]
+    else:
+        first_frame = video_tensor[:, :1, :, :].unsqueeze(0).to(device)  # [1, C, 1, H, W]
     clip_features = clip_model.visual(first_frame)  # [1, 257, 1280]
+    # Original pipeline casts to param_dtype=bfloat16 after CLIP
+    clip_features = clip_features.to(torch.bfloat16)
     return clip_features.cpu()
 
 
@@ -532,9 +579,18 @@ def process_sample(
     video_tensor = resize_and_center_crop(frames, target_h, target_w)
     # video_tensor: [3, T, H, W] float32 in [-1, 1]
 
+    # ---- Extract first frame as PIL and apply original preprocessing ----
+    # The original pipeline (multitalk.py) uses PIL BILINEAR resize + center_crop
+    # for the reference frame. This is used by CLIP and VAE first_frame_cond.
+    from PIL import Image
+    first_frame_pil = Image.fromarray(frames[0])  # [H, W, 3] uint8 → PIL
+    cond_image = resize_and_centercrop_pil(first_frame_pil, target_h, target_w)
+    # cond_image: [1, C, 1, H, W] float32 in [-1, 1]
+
     # ---- VAE encode ----
     logger.info("  Encoding VAE...")
-    latents, first_frame_cond = encode_vae(vae, video_tensor, device)
+    latents, first_frame_cond = encode_vae(
+        vae, video_tensor, device, cond_image=cond_image)
     torch.save(latents, os.path.join(sample_dir, "vae_latents.pt"))
     torch.save(first_frame_cond, os.path.join(sample_dir, "first_frame_cond.pt"))
     del latents, first_frame_cond
@@ -542,7 +598,7 @@ def process_sample(
 
     # ---- CLIP encode ----
     logger.info("  Encoding CLIP...")
-    clip_features = encode_clip(clip_model, video_tensor, device)
+    clip_features = encode_clip(clip_model, device, cond_image=cond_image)
     torch.save(clip_features, os.path.join(sample_dir, "clip_features.pt"))
     del clip_features
     torch.cuda.empty_cache()
