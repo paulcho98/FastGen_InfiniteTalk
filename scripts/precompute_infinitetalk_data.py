@@ -638,6 +638,10 @@ def main():
                         help="Path to chinese-wav2vec2-base/ directory")
     parser.add_argument("--num_samples", type=int, default=0,
                         help="Process only first N samples (0 = all)")
+    parser.add_argument("--start_idx", type=int, default=0,
+                        help="Start index in CSV (for multi-GPU sharding)")
+    parser.add_argument("--end_idx", type=int, default=-1,
+                        help="End index in CSV, exclusive (-1 = all)")
     parser.add_argument("--resolution", type=int, default=640,
                         help="Target square resolution (default 640 for 480p bucket)")
     parser.add_argument("--frame_count", type=int, default=81,
@@ -664,7 +668,13 @@ def main():
     total = len(rows)
     if args.num_samples > 0:
         rows = rows[: args.num_samples]
-    logger.info("Loaded %d / %d samples from CSV", len(rows), total)
+    # Apply start_idx / end_idx sharding (for multi-GPU parallel runs)
+    if args.start_idx > 0 or args.end_idx >= 0:
+        end = args.end_idx if args.end_idx >= 0 else len(rows)
+        rows = rows[args.start_idx : end]
+    logger.info("Loaded %d / %d samples from CSV (range [%d:%d])",
+                len(rows), total, args.start_idx,
+                args.end_idx if args.end_idx >= 0 else total)
 
     # ---- Load encoders ----
     logger.info("Loading encoders to %s ...", args.device)
