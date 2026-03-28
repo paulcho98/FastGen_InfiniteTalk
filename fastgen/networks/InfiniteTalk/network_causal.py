@@ -330,6 +330,16 @@ class CausalSelfAttention(nn.Module):
     In AR mode (kv_cache provided): uses flash attention with gradient-safe
     KV caching (detached writes, cat [detached_past | live_current]).
 
+    Supports:
+      - ``local_attn_size``: rolling local attention window (in frames).
+        ``-1`` means attend to everything in the cache.
+      - ``sink_size``: number of initial frames always kept in the window
+        (attention-sink tokens, never dropped from view).
+      - ``use_dynamic_rope``: cache raw K (without RoPE), apply window-local
+        RoPE at attention time.  Required for correct position encoding
+        when using rolling eviction (otherwise evicted-then-re-viewed
+        tokens have stale absolute positions).
+
     Weight-compatible with ``WanSelfAttention`` from wan_model.py -- same
     q/k/v/o Linear layers and norm_q/norm_k RMSNorm layers.
     """
@@ -341,6 +351,9 @@ class CausalSelfAttention(nn.Module):
         window_size: Tuple[int, int] = (-1, -1),
         qk_norm: bool = True,
         eps: float = 1e-6,
+        local_attn_size: int = -1,
+        sink_size: int = 0,
+        use_dynamic_rope: bool = False,
     ):
         assert dim % num_heads == 0
         super().__init__()
@@ -350,6 +363,9 @@ class CausalSelfAttention(nn.Module):
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
+        self.local_attn_size = local_attn_size
+        self.sink_size = sink_size
+        self.use_dynamic_rope = use_dynamic_rope
 
         # Layers -- same names as WanSelfAttention for weight compatibility
         self.q = nn.Linear(dim, dim)
@@ -433,19 +449,26 @@ class CausalSelfAttention(nn.Module):
             current_start_frame = current_start // frame_seqlen
             num_new_tokens = q.shape[1]
             current_end = current_start + num_new_tokens
+            kv_cache_size = kv_cache["k"].shape[1]
+            sink_tokens = self.sink_size * frame_seqlen
 
-            # Apply RoPE with frame offset
-            roped_q = causal_rope_apply(
-                q, grid_sizes, freqs, start_frame=current_start_frame
-            ).type_as(v)
-            roped_k = causal_rope_apply(
-                k, grid_sizes, freqs, start_frame=current_start_frame
-            ).type_as(v)
-            k_to_cache = roped_k
+            # -- 1. Prepare K for caching (mode-dependent) --
+            if not self.use_dynamic_rope:
+                # Original mode: apply RoPE before caching (absolute positions)
+                roped_q = causal_rope_apply(
+                    q, grid_sizes, freqs, start_frame=current_start_frame
+                ).type_as(v)
+                roped_k = causal_rope_apply(
+                    k, grid_sizes, freqs, start_frame=current_start_frame
+                ).type_as(v)
+                k_to_cache = roped_k
+            else:
+                # Dynamic mode: cache raw keys; RoPE applied later on window
+                k_to_cache = k
 
-            # Read cache metadata
+            # -- 2. Read cache metadata --
             # Use the explicit override (frozen before the block loop)
-            # to ensure gradient-checkpointing recomputation sees the same state
+            # to ensure gradient-checkpointing recomputation sees the same state.
             if cache_local_end_override is not None:
                 local_end = cache_local_end_override
                 global_end = cache_local_end_override
@@ -453,30 +476,96 @@ class CausalSelfAttention(nn.Module):
                 global_end = kv_cache["global_end_index"].item()
                 local_end = kv_cache["local_end_index"].item()
 
-            # No eviction needed for InfiniteTalk (21 frames total, cache fits)
-            new_local_end = local_end + max(0, current_end - global_end)
-            new_local_start = new_local_end - num_new_tokens
+            # -- 3. Handle physical eviction (only when buffer overflows) --
+            # This is a FALLBACK for inference with small cache buffers.
+            # During training, cache_size == total_tokens, so this never fires.
+            if (
+                store_kv
+                and self.local_attn_size > 0
+                and current_end > global_end
+                and num_new_tokens + local_end > kv_cache_size
+            ):
+                num_evicted = num_new_tokens + local_end - kv_cache_size
+                num_rolled = local_end - num_evicted - sink_tokens
+                kv_cache["k"][:, sink_tokens:sink_tokens + num_rolled] = \
+                    kv_cache["k"][:, sink_tokens + num_evicted:sink_tokens + num_evicted + num_rolled].clone()
+                kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled] = \
+                    kv_cache["v"][:, sink_tokens + num_evicted:sink_tokens + num_evicted + num_rolled].clone()
+                new_local_end = local_end + (current_end - global_end) - num_evicted
+                new_local_start = new_local_end - num_new_tokens
+            else:
+                # No eviction: simple append
+                new_local_end = local_end + max(0, current_end - global_end)
+                new_local_start = new_local_end - num_new_tokens
 
-            # Write to cache (detached, only if store_kv)
+            # -- 4. Write to cache (detached, only if store_kv) --
             if store_kv:
                 kv_cache["k"][:, new_local_start:new_local_end] = k_to_cache.detach()
                 kv_cache["v"][:, new_local_start:new_local_end] = v.detach()
 
-            # Build attention window (simple contiguous case -- no eviction)
-            if new_local_start == 0:
-                k_win = k_to_cache
-                v_win = v
+            # -- 5. Build attention window --
+            # Compute the max attention span in tokens
+            if self.local_attn_size > 0:
+                max_attn_tokens = self.local_attn_size * frame_seqlen
             else:
+                max_attn_tokens = new_local_end  # attend to everything
+
+            k_win_start = max(0, new_local_end - max_attn_tokens)
+
+            if sink_tokens > 0 and k_win_start > sink_tokens:
+                # Sink + rolling window (non-contiguous regions)
+                available_rolling = max_attn_tokens - sink_tokens
+                rolling_start = max(sink_tokens, new_local_end - available_rolling)
+
                 with torch.no_grad():
-                    k_past = kv_cache["k"][:, :new_local_start]
-                    v_past = kv_cache["v"][:, :new_local_start]
+                    k_past = torch.cat([
+                        kv_cache["k"][:, :sink_tokens],
+                        kv_cache["k"][:, rolling_start:new_local_start],
+                    ], dim=1)
+                    v_past = torch.cat([
+                        kv_cache["v"][:, :sink_tokens],
+                        kv_cache["v"][:, rolling_start:new_local_start],
+                    ], dim=1)
                 k_win = torch.cat([k_past, k_to_cache], dim=1)
                 v_win = torch.cat([v_past, v], dim=1)
+                query_offset_in_win = sink_tokens + (new_local_start - rolling_start)
+            else:
+                # Simple contiguous case (no sink gap)
+                if new_local_start == 0:
+                    k_win = k_to_cache
+                    v_win = v
+                else:
+                    with torch.no_grad():
+                        k_past = kv_cache["k"][:, k_win_start:new_local_start]
+                        v_past = kv_cache["v"][:, k_win_start:new_local_start]
+                    k_win = torch.cat([k_past, k_to_cache], dim=1)
+                    v_win = torch.cat([v_past, v], dim=1)
+                query_offset_in_win = new_local_start - k_win_start
 
-            # Attention
-            x = _flash_attention(roped_q, k_win, v_win)
+            # -- 6. Apply RoPE (mode-dependent) --
+            if not self.use_dynamic_rope:
+                # Original mode: Q already rotated, k_win contains rotated keys
+                roped_query = roped_q
+                roped_key = k_win
+            else:
+                # Dynamic mode: apply window-local RoPE to the full window
+                F_window = k_win.shape[1] // frame_seqlen
+                k_grid = grid_sizes.clone()
+                k_grid[:, 0] = F_window
+                roped_key = causal_rope_apply(
+                    k_win, k_grid, freqs, start_frame=0
+                ).type_as(v)
 
-            # Update metadata
+                # Q position within the window
+                q_frame_start = query_offset_in_win // frame_seqlen
+                roped_query = causal_rope_apply(
+                    q, grid_sizes, freqs, start_frame=q_frame_start
+                ).type_as(v)
+
+            # -- 7. Attention --
+            x = _flash_attention(roped_query, roped_key, v_win)
+
+            # -- 8. Update metadata (only if store_kv) --
             if store_kv:
                 kv_cache["global_end_index"].fill_(current_end)
                 kv_cache["local_end_index"].fill_(new_local_end)
@@ -596,6 +685,9 @@ class CausalDiTBlock(nn.Module):
         eps: float = 1e-6,
         output_dim: int = 768,
         norm_input_visual: bool = True,
+        local_attn_size: int = -1,
+        sink_size: int = 0,
+        use_dynamic_rope: bool = False,
     ):
         super().__init__()
         self.dim = dim
@@ -608,7 +700,12 @@ class CausalDiTBlock(nn.Module):
 
         # Self-attention (causal variant with KV cache)
         self.norm1 = WanLayerNorm(dim, eps)
-        self.self_attn = CausalSelfAttention(dim, num_heads, window_size, qk_norm, eps)
+        self.self_attn = CausalSelfAttention(
+            dim, num_heads, window_size, qk_norm, eps,
+            local_attn_size=local_attn_size,
+            sink_size=sink_size,
+            use_dynamic_rope=use_dynamic_rope,
+        )
 
         # Cross-attention (I2V)
         self.norm3 = WanLayerNorm(
@@ -861,6 +958,9 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         num_layers: int = 40,
         audio_window: int = 5,
         vae_scale: int = 4,
+        local_attn_size: int = -1,
+        sink_size: int = 0,
+        use_dynamic_rope: bool = False,
         **kwargs,
     ):
         """
@@ -918,6 +1018,9 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         self._in_dim = _COMMON_CFG["in_dim"]
         self._vae_scale = vae_scale
         self._audio_window = audio_window
+        self.local_attn_size = local_attn_size
+        self.sink_size = sink_size
+        self.use_dynamic_rope = use_dynamic_rope
 
         eps = _COMMON_CFG["eps"]
         patch_size = _COMMON_CFG["patch_size"]
@@ -957,6 +1060,9 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
                 _COMMON_CFG["cross_attn_norm"], eps,
                 output_dim=_AUDIO_DEFAULTS["output_dim"],
                 norm_input_visual=_AUDIO_DEFAULTS["norm_input_visual"],
+                local_attn_size=local_attn_size,
+                sink_size=sink_size,
+                use_dynamic_rope=use_dynamic_rope,
             )
             for _ in range(num_layers)
         ])

@@ -76,7 +76,7 @@ CMD_ARGS=(
     --audio_guide_scale "${AUDIO_GUIDE_SCALE}"
     --num_steps "${NUM_STEPS}"
     --shift "${SHIFT}"
-    --t_list 0.999 0.937 0.833 0.624 0.0
+    --t_list 0.999 0.955 0.875 0.700 0.0
     --batch_size "${BATCH_SIZE}"
     --seed "${SEED}"
     --skip_existing

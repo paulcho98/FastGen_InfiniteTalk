@@ -41,15 +41,17 @@ class InfiniteTalkDiffusionForcingModel(KDModel):
         super().__init__(config)
 
     def build_model(self):
-        """Build model, re-apply LoRA freeze, and optionally load VAE for visual logging."""
+        """Build model and re-apply LoRA freeze.
+
+        VAE is NOT loaded here — loading it manipulates sys.modules (xformers mock)
+        which poisons torch.compile/inductor for FlexAttention. Instead, VAE is
+        loaded lazily on the first _get_outputs call that needs it (after torch.compile
+        is done).
+        """
         super().build_model()
         from fastgen.networks.InfiniteTalk.lora import freeze_base
         freeze_base(self.net)
-
-        # Load VAE for visual sample logging (WandbCallback decodes gen_rand with model.net.vae)
-        vae_path = getattr(self.config, "vae_path", None)
-        if vae_path and os.path.exists(vae_path):
-            self._load_vae(vae_path)
+        self._vae_load_attempted = False
 
     def _load_vae(self, vae_path: str):
         """Load WanVAE for decoding generated samples in wandb visual logging."""
@@ -109,7 +111,23 @@ class InfiniteTalkDiffusionForcingModel(KDModel):
     _student_sample_loop = CausVidModel._student_sample_loop
 
     def _build_condition(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Build InfiniteTalk condition dict from data batch."""
+        """Build InfiniteTalk condition dict from data batch.
+
+        Expected shapes (after collation, with batch dim):
+            text_embeds:      [B, 1, 512, 4096] or [B, 512, 4096]
+            first_frame_cond: [B, 16, T, H, W]
+            clip_features:    [B, 1, 257, 1280] or [B, 257, 1280]
+            audio_emb:        [B, 81, 12, 768]
+        """
+        for key in ("text_embeds", "first_frame_cond", "clip_features", "audio_emb"):
+            assert key in data, f"Missing required key '{key}' in data batch"
+        assert data["first_frame_cond"].shape[1] == 16, (
+            f"first_frame_cond should have 16 channels (VAE only, mask added at runtime), "
+            f"got {data['first_frame_cond'].shape[1]}"
+        )
+        assert data["audio_emb"].shape[-2:] == (12, 768), (
+            f"audio_emb should have shape [..., 12, 768], got {list(data['audio_emb'].shape)}"
+        )
         return {
             "text_embeds": data["text_embeds"],
             "first_frame_cond": data["first_frame_cond"],
@@ -117,16 +135,25 @@ class InfiniteTalkDiffusionForcingModel(KDModel):
             "audio_emb": data["audio_emb"],
         }
 
+    def _ensure_vae_loaded(self):
+        """Lazily load VAE on first call. Must happen AFTER torch.compile finishes."""
+        if self._vae_load_attempted:
+            return hasattr(self.net, 'vae')
+        self._vae_load_attempted = True
+        vae_path = getattr(self.config, "vae_path", None)
+        if vae_path and os.path.exists(vae_path):
+            self._load_vae(vae_path)
+            return True
+        return False
+
     def _get_outputs(
         self,
         gen_data: torch.Tensor,
         input_student: torch.Tensor = None,
         condition: Any = None,
     ) -> Dict[str, torch.Tensor | Callable]:
-        # If VAE is loaded, provide a callable for multi-step visual generation.
-        has_vae = hasattr(self.net, 'vae')
-        if not has_vae:
-            logger.debug("No VAE loaded on net — visual logging disabled")
+        # Lazily load VAE (deferred from build_model to avoid poisoning torch.compile)
+        has_vae = self._ensure_vae_loaded()
         if has_vae and condition is not None:
             noise = torch.randn_like(gen_data, dtype=self.precision)
             gen_rand_func = partial(

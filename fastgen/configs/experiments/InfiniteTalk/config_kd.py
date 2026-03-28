@@ -61,7 +61,8 @@ def create_config():
     config.model.sample_t_cfg.shift = 7.0
     config.model.sample_t_cfg.min_t = 0.001
     config.model.sample_t_cfg.max_t = 0.999
-    config.model.sample_t_cfg.t_list = [0.999, 0.937, 0.833, 0.624, 0.0]
+    # t_list derived from shift=7.0: new_t = 7*t / (1 + 6*t) applied to linspace(1,0,5)
+    config.model.sample_t_cfg.t_list = [0.999, 0.955, 0.875, 0.700, 0.0]
 
     # KD settings
     config.model.student_sample_steps = 4

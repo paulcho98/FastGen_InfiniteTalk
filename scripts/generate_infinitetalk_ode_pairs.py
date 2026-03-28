@@ -123,7 +123,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--t_list", type=float, nargs="+",
-        default=[0.999, 0.937, 0.833, 0.624, 0.0],
+        default=[0.999, 0.955, 0.875, 0.700, 0.0],  # shift=7.0
         help="Target noise levels for trajectory subsampling "
              "(last value should be 0.0 for clean state)",
     )
@@ -458,7 +458,7 @@ def extract_ode_trajectory(
         to clean.  The clean state (t=0) is the last element.
     """
     if target_t_list is None:
-        target_t_list = [0.999, 0.937, 0.833, 0.624, 0.0]
+        target_t_list = [0.999, 0.955, 0.875, 0.700, 0.0]  # shift=7.0
 
     num_timesteps = 1000
 

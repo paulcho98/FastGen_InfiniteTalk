@@ -739,6 +739,10 @@ class InfiniteTalkDataset(Dataset):
                 v for v in first_frame_cond.values() if isinstance(v, torch.Tensor)
             )
         first_frame_cond = first_frame_cond.to(torch.bfloat16)  # [16, 21, H, W]
+        assert first_frame_cond.shape[0] == 16, (
+            f"Expected first_frame_cond with 16 channels, got {first_frame_cond.shape[0]}. "
+            f"Sample: {sample_dir}"
+        )
 
         # --- CLIP features ---
         clip_features = torch.load(
@@ -751,6 +755,10 @@ class InfiniteTalkDataset(Dataset):
                 v for v in clip_features.values() if isinstance(v, torch.Tensor)
             )
         clip_features = clip_features.to(torch.bfloat16)  # [1, 257, 1280]
+        assert clip_features.shape[-2:] == (257, 1280), (
+            f"Expected clip_features [..., 257, 1280], got {list(clip_features.shape)}. "
+            f"Sample: {sample_dir}"
+        )
 
         # --- Audio embeddings ---
         audio_emb = torch.load(
@@ -762,7 +770,15 @@ class InfiniteTalkDataset(Dataset):
             audio_emb = next(
                 v for v in audio_emb.values() if isinstance(v, torch.Tensor)
             )
-        # Truncate to num_video_frames if longer
+        # Validate and truncate to num_video_frames
+        assert audio_emb.shape[0] >= self.num_video_frames, (
+            f"audio_emb has {audio_emb.shape[0]} frames, need >= {self.num_video_frames}. "
+            f"Sample: {sample_dir}"
+        )
+        assert audio_emb.dim() == 3 and audio_emb.shape[1:] == (12, 768), (
+            f"Expected audio_emb shape [T, 12, 768], got {list(audio_emb.shape)}. "
+            f"Sample: {sample_dir}"
+        )
         audio_emb = audio_emb[: self.num_video_frames]  # [81, 12, 768]
         audio_emb = audio_emb.to(torch.bfloat16)
 
