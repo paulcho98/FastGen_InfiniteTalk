@@ -1,157 +1,173 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-WandbCallback subclass that muxes source audio into generated video samples.
+WandbCallback for InfiniteTalk — validation videos as lists, GT uploaded once.
 
-For InfiniteTalk talking-face generation, visual-only videos are insufficient
-for verifying lip-sync quality. This callback detects 'audio_path' in the
-data batch (provided by InfiniteTalkDataset when audio_data_root is set)
-and muxes the corresponding audio segment into wandb video logs.
+Follows the OmniAvatar pattern:
+  - on_dataloader_init_end: decode + upload GT val videos once
+  - on_validation_step_end: AR-generate student video, collect into list
+  - on_validation_end: log all val videos as a wandb list
+  - get_sample_map: handles standalone DiT (no init_preprocessors)
 """
 
+import gc
 import os
-import subprocess
-import tempfile
 from typing import Optional, Callable
 
 import torch
 import wandb
 
 from fastgen.callbacks.wandb import WandbCallback, to_wandb
-from fastgen.utils.distributed import rank0_only
+from fastgen.utils.distributed import rank0_only, synchronize, is_rank0
+from fastgen.utils import basic_utils
 import fastgen.utils.logging_utils as logger
 
 
-def _to_wandb_with_audio(
-    tensor: torch.Tensor,
-    audio_path: str,
-    fps: int = 25,
-    vid_format: str = "mp4",
-    caption: Optional[str] = None,
-) -> wandb.Video:
-    """Convert video tensor to wandb.Video with muxed audio from source file."""
-    try:
-        import imageio_ffmpeg
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    except ImportError:
-        return to_wandb(tensor, fps=fps, vid_format=vid_format, caption=caption)
-
-    # tensor is [B, T, C, H, W] uint8 at this point (from to_wandb preprocessing)
-    # But we receive it BEFORE to_wandb conversion, as [B, C, T, H, W] float [-1,1]
-    if tensor.ndim == 5:
-        vid = tensor[0]  # [C, T, H, W]
-    else:
-        vid = tensor  # [C, T, H, W] or [T, C, H, W]
-
-    # Ensure [C, T, H, W] → [T, H, W, C]
-    if vid.shape[0] == 3:  # C first
-        frames = vid.permute(1, 2, 3, 0)
-    else:  # T first
-        frames = vid.permute(0, 2, 3, 1)
-
-    frames = ((frames + 1) / 2 * 255).clamp(0, 255).byte().cpu().numpy()
-    num_frames, h, w, _ = frames.shape
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        noaudio_path = os.path.join(tmpdir, f"noaudio.{vid_format}")
-        output_path = os.path.join(tmpdir, f"with_audio.{vid_format}")
-
-        cmd = [
-            ffmpeg_exe, "-y",
-            "-f", "rawvideo", "-vcodec", "rawvideo",
-            "-s", f"{w}x{h}", "-pix_fmt", "rgb24", "-r", str(fps),
-            "-i", "-",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
-            noaudio_path,
-        ]
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        for i in range(num_frames):
-            proc.stdin.write(frames[i].tobytes())
-        proc.stdin.close()
-        proc.wait()
-
-        duration = num_frames / fps
-        mux_cmd = [
-            ffmpeg_exe, "-y",
-            "-i", noaudio_path, "-i", audio_path,
-            "-c:v", "copy", "-c:a", "aac",
-            "-t", f"{duration:.3f}", "-shortest",
-            output_path,
-        ]
-        result = subprocess.run(mux_cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            return wandb.Video(output_path, fps=fps, format=vid_format, caption=caption)
-
-    # Fallback: no audio
-    return to_wandb(tensor, fps=fps, vid_format=vid_format, caption=caption)
-
-
 class InfiniteTalkWandbCallback(WandbCallback):
-    """WandbCallback that muxes source audio into generated video samples.
-
-    When the data batch contains 'audio_path' (string path to source .wav),
-    all logged video samples get the corresponding audio muxed in via ffmpeg.
-    """
+    """WandbCallback with list-based validation logging and audio muxing."""
 
     def __init__(self, *args, audio_fps: int = 25, **kwargs):
         super().__init__(*args, **kwargs)
         self.audio_fps = audio_fps
-        self._gt_logged = False  # only log GT real data once
+        self._val_gen_videos: list[torch.Tensor] = []
+        self._val_gt_videos: list[torch.Tensor] = []
+        self._gt_uploaded = False
+
+    @staticmethod
+    def _to_uint8_video(tensor: torch.Tensor) -> torch.Tensor:
+        """Convert [B, C, T, H, W] float [-1,1] → [B, T, C, H, W] uint8 CPU."""
+        if isinstance(tensor, (list, tuple)):
+            tensor = torch.stack(tensor) if len(tensor) > 1 else tensor[0].unsqueeze(0)
+        t = tensor.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W] → [B, T, C, H, W]
+        return t.mul(127.5).add(127.5).clamp(0, 255).to(torch.uint8).cpu()
+
+    @rank0_only
+    def on_dataloader_init_end(
+        self, model, dataloader_train, dataloader_val, iteration: int = 0
+    ) -> None:
+        """Upload GT validation videos once at the start."""
+        if dataloader_val is None or not wandb.run:
+            return
+        if not hasattr(model.net, "vae"):
+            logger.info("No VAE loaded — skipping GT val video upload")
+            return
+
+        logger.info("Uploading GT validation videos to wandb...")
+        device = model.device
+        try:
+            gt_videos = []
+            with torch.no_grad(), basic_utils.inference_mode(
+                precision_amp=model.precision_amp_enc, device_type=device.type
+            ):
+                for step, data in enumerate(dataloader_val):
+                    real = data["real"].to(device)
+                    decoded = model.net.vae.decode(real[:1].float())
+                    gt_videos.append(self._to_uint8_video(decoded))
+            gt_list = [
+                wandb.Video(v[0].numpy(), fps=self.audio_fps, format="mp4")
+                for v in gt_videos
+            ]
+            wandb.log({"val_gt/videos": gt_list}, step=0)
+            self._gt_uploaded = True
+            logger.info(f"Uploaded {len(gt_videos)} GT validation videos to wandb")
+        except Exception as e:
+            logger.warning(f"Failed to upload GT val videos: {e}")
+        synchronize()
+
+    def on_validation_step_end(
+        self,
+        model,
+        data_batch: dict[str, torch.Tensor],
+        output_batch: dict[str, torch.Tensor | Callable],
+        loss_dict: dict[str, torch.Tensor],
+        step: int = 0,
+        iteration: int = 0,
+        idx: int = 0,
+    ) -> None:
+        """Collect val loss + generate student video per sample."""
+        self.val_loss_dict_record.add(loss_dict)
+
+        if step % self.validation_logging_step != 0:
+            return
+        if not is_rank0():
+            return
+        if not hasattr(model.net, "vae"):
+            return
+
+        # AR-generate student video
+        gen_rand = output_batch.get("gen_rand")
+        if gen_rand is not None and isinstance(gen_rand, Callable):
+            synchronize()
+            gen_rand = gen_rand()
+            synchronize()
+
+        if gen_rand is None:
+            return
+
+        # gen_rand is pixel-space [B, C, T, H, W] from our _generate_and_decode callable
+        self._val_gen_videos.append(self._to_uint8_video(gen_rand))
+
+        # Also decode GT if not yet uploaded (first validation)
+        if not self._gt_uploaded:
+            device = model.device
+            with torch.no_grad(), basic_utils.inference_mode(
+                precision_amp=model.precision_amp_enc, device_type=device.type
+            ):
+                gt_decoded = model.net.vae.decode(data_batch["real"][:1].to(device).float())
+            self._val_gt_videos.append(self._to_uint8_video(gt_decoded))
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def on_validation_end(self, model, iteration: int = 0, idx: int = 0) -> None:
+        """Log all collected val videos as lists + val loss."""
+        self.log_stats(self.val_loss_dict_record, iteration=iteration, group=f"val{idx}")
+
+        if wandb.run and self._val_gen_videos and is_rank0():
+            gen_list = [
+                wandb.Video(v[0].numpy(), fps=self.audio_fps, format="mp4")
+                for v in self._val_gen_videos
+            ]
+            log_dict = {f"val{idx}/generated": gen_list}
+
+            if self._val_gt_videos:
+                gt_list = [
+                    wandb.Video(v[0].numpy(), fps=self.audio_fps, format="mp4")
+                    for v in self._val_gt_videos
+                ]
+                log_dict[f"val{idx}/reconstructed"] = gt_list
+                self._gt_uploaded = True
+
+            wandb.log(log_dict, step=iteration)
+            logger.info(f"Logged {len(self._val_gen_videos)} val videos at iteration {iteration}")
+
+        self._val_gen_videos = []
+        self._val_gt_videos = []
 
     def get_sample_map(self, model, data_batch, output_batch):
-        """Override to handle InfiniteTalk's standalone DiT (no init_preprocessors).
+        """Training sample map — only called for sample_logging_iter.
 
-        The base WandbCallback.get_sample_map assumes model.net has init_preprocessors
-        (diffusers-specific) to VAE-decode latents. Our standalone port doesn't have this,
-        so gen_rand is already pixel-space (decoded in _get_outputs callable) but
-        data_batch["real"] is still a latent. We handle this by only logging gen_rand
-        and skipping raw latent logging.
+        Returns empty since validation handles all visual logging.
         """
-        # Only generate visuals on rank 0 (avoids duplicate AR generation on other ranks)
-        from fastgen.utils.distributed import is_rank0
         if not is_rank0():
             return {}
-
         if "gen_rand" not in output_batch:
             return {}
-
-        from fastgen.callbacks.wandb import to_wandb
-        from fastgen.utils.distributed import synchronize
-        from typing import Callable
-        import gc
 
         sample_map = {}
         gen_rand = output_batch["gen_rand"]
 
-        # Call the gen_rand callable (AR generation + VAE decode)
         if isinstance(gen_rand, Callable):
             synchronize()
             gen_rand = gen_rand()
             synchronize()
 
-        # gen_rand is now pixel-space [B, C, T, H, W] or [C, T, H, W]
         if wandb.run and gen_rand is not None:
             try:
                 sample_map["student/generation"] = to_wandb(
                     gen_rand, fps=self.audio_fps, vid_format=self.vid_format
                 )
             except Exception as e:
-                logger.warning(f"Failed to log student generation to wandb: {e}")
-
-            # Decode and log real (GT) data only once — it doesn't change during training
-            if not self._gt_logged and "real" in data_batch and hasattr(model.net, 'vae'):
-                try:
-                    from fastgen.utils.basic_utils import inference_mode
-                    with inference_mode(model.net, precision_amp=model.precision_amp_enc,
-                                       device_type=model.device.type if hasattr(model.device, 'type') else 'cuda'):
-                        real_decoded = model.net.vae.decode(data_batch["real"][:1].float())
-                        if isinstance(real_decoded, (list, tuple)):
-                            real_decoded = real_decoded[0].unsqueeze(0) if len(real_decoded) == 1 else torch.stack(real_decoded)
-                    sample_map["data/real"] = to_wandb(
-                        real_decoded, fps=self.audio_fps, vid_format=self.vid_format
-                    )
-                    self._gt_logged = True
-                except Exception as e:
-                    logger.warning(f"Failed to decode/log real data: {e}")
+                logger.warning(f"Failed to log student generation: {e}")
 
         synchronize()
         gc.collect()
