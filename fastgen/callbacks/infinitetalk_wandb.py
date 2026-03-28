@@ -97,39 +97,56 @@ class InfiniteTalkWandbCallback(WandbCallback):
         self.audio_fps = audio_fps
 
     def get_sample_map(self, model, data_batch, output_batch):
-        """Override to mux audio into video samples."""
-        # Guard: if gen_rand is not in output_batch, return empty (no visual to log)
+        """Override to handle InfiniteTalk's standalone DiT (no init_preprocessors).
+
+        The base WandbCallback.get_sample_map assumes model.net has init_preprocessors
+        (diffusers-specific) to VAE-decode latents. Our standalone port doesn't have this,
+        so gen_rand is already pixel-space (decoded in _get_outputs callable) but
+        data_batch["real"] is still a latent. We handle this by only logging gen_rand
+        and skipping raw latent logging.
+        """
         if "gen_rand" not in output_batch:
-            logger.debug("No 'gen_rand' in output_batch, skipping sample map")
             return {}
 
-        # Get audio path from data batch (string, not collated as tensor)
-        audio_path = data_batch.get("audio_path")
-        if isinstance(audio_path, (list, tuple)):
-            audio_path = audio_path[0]
-        if not isinstance(audio_path, str) or not os.path.exists(str(audio_path)):
-            audio_path = None
+        from fastgen.callbacks.wandb import to_wandb
+        from fastgen.utils.distributed import synchronize
+        from typing import Callable
+        import gc
 
-        # Run base get_sample_map but intercept the to_wandb calls
-        # by temporarily replacing the module-level to_wandb function
-        if audio_path is None:
-            return super().get_sample_map(model, data_batch, output_batch)
+        sample_map = {}
+        gen_rand = output_batch["gen_rand"]
 
-        # With audio: run the base logic but use our audio-muxing to_wandb
-        import fastgen.callbacks.wandb as wandb_module
-        original_to_wandb = wandb_module.to_wandb
+        # Call the gen_rand callable (AR generation + VAE decode)
+        if isinstance(gen_rand, Callable):
+            synchronize()
+            gen_rand = gen_rand()
+            synchronize()
 
-        def _to_wandb_audio_wrapper(tensor, **kwargs):
-            # Only mux audio for video tensors (5D), not images (4D)
-            if tensor.ndim == 5:
-                kwargs.setdefault("fps", self.audio_fps)
-                return _to_wandb_with_audio(tensor, audio_path, **kwargs)
-            return original_to_wandb(tensor, **kwargs)
+        # gen_rand is now pixel-space [B, C, T, H, W] or [C, T, H, W]
+        if wandb.run and gen_rand is not None:
+            try:
+                sample_map["student/generation"] = to_wandb(
+                    gen_rand, fps=self.audio_fps, vid_format=self.vid_format
+                )
+            except Exception as e:
+                logger.warning(f"Failed to log student generation to wandb: {e}")
 
-        wandb_module.to_wandb = _to_wandb_audio_wrapper
-        try:
-            result = super().get_sample_map(model, data_batch, output_batch)
-        finally:
-            wandb_module.to_wandb = original_to_wandb
+            # Also decode and log real data if VAE is available
+            if "real" in data_batch and hasattr(model.net, 'vae'):
+                try:
+                    from fastgen.utils.basic_utils import inference_mode
+                    with inference_mode(model.net, precision_amp=model.precision_amp_enc,
+                                       device_type=model.device.type if hasattr(model.device, 'type') else 'cuda'):
+                        real_decoded = model.net.vae.decode(data_batch["real"][:1].float())
+                        if isinstance(real_decoded, (list, tuple)):
+                            real_decoded = real_decoded[0].unsqueeze(0) if len(real_decoded) == 1 else torch.stack(real_decoded)
+                    sample_map["data/real"] = to_wandb(
+                        real_decoded, fps=self.audio_fps, vid_format=self.vid_format
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to decode/log real data: {e}")
 
-        return result
+        synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        return sample_map

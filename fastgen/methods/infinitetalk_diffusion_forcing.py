@@ -52,6 +52,9 @@ class InfiniteTalkDiffusionForcingModel(KDModel):
         from fastgen.networks.InfiniteTalk.lora import freeze_base
         freeze_base(self.net)
         self._vae_load_attempted = False
+        logger.info(f"[build_model] config type={type(self.config).__name__}, "
+                    f"has vae_path={hasattr(self.config, 'vae_path')}, "
+                    f"vae_path={getattr(self.config, 'vae_path', 'MISSING')}")
 
     def _load_vae(self, vae_path: str):
         """Load WanVAE for decoding generated samples in wandb visual logging."""
@@ -136,14 +139,27 @@ class InfiniteTalkDiffusionForcingModel(KDModel):
         }
 
     def _ensure_vae_loaded(self):
-        """Lazily load VAE on first call. Must happen AFTER torch.compile finishes."""
+        """Lazily load VAE on first call. Must happen AFTER torch.compile finishes.
+
+        VAE path comes from INFINITETALK_VAE_PATH env var (not config.model.vae_path,
+        which gets lost during attrs serialization in DDP).
+        """
         if self._vae_load_attempted:
             return hasattr(self.net, 'vae')
         self._vae_load_attempted = True
-        vae_path = getattr(self.config, "vae_path", None)
+        # Try env var first (reliable across DDP), then config attr (fallback)
+        vae_path = os.environ.get("INFINITETALK_VAE_PATH") or getattr(self.config, "vae_path", None)
         if vae_path and os.path.exists(vae_path):
-            self._load_vae(vae_path)
-            return True
+            try:
+                self._load_vae(vae_path)
+                return True
+            except Exception as e:
+                logger.warning(f"Failed to load VAE from {vae_path}: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
+        logger.info(f"No VAE path found (env={os.environ.get('INFINITETALK_VAE_PATH')}, "
+                    f"config={getattr(self.config, 'vae_path', None)}) — visual logging disabled")
         return False
 
     def _get_outputs(
@@ -156,16 +172,29 @@ class InfiniteTalkDiffusionForcingModel(KDModel):
         has_vae = self._ensure_vae_loaded()
         if has_vae and condition is not None:
             noise = torch.randn_like(gen_data, dtype=self.precision)
-            gen_rand_func = partial(
-                self.generator_fn,
-                net=self.net_inference,
-                noise=noise,
-                condition=condition,
-                student_sample_steps=self.config.student_sample_steps,
-                t_list=self.config.sample_t_cfg.t_list,
-                precision_amp=self.precision_amp_infer,
-            )
-            return {"gen_rand": gen_rand_func, "input_rand": noise, "gen_rand_train": gen_data}
+
+            # Wrap the AR generation + VAE decode in a single callable.
+            # The base WandbCallback only decodes if model.net has init_preprocessors
+            # (diffusers-specific), which our standalone port doesn't have.
+            # So we decode here and return pixel-space video directly.
+            def _generate_and_decode():
+                with torch.no_grad():
+                    latent = self.generator_fn(
+                        net=self.net_inference,
+                        noise=noise,
+                        condition=condition,
+                        student_sample_steps=self.config.student_sample_steps,
+                        t_list=self.config.sample_t_cfg.t_list,
+                        precision_amp=self.precision_amp_infer,
+                    )
+                    # Decode latent → pixel video
+                    video = self.net.vae.decode(latent[:1].float())
+                    # WanVAE.decode may return a list; ensure tensor [B, C, T, H, W]
+                    if isinstance(video, (list, tuple)):
+                        video = torch.stack(video) if len(video) > 1 else video[0].unsqueeze(0)
+                    return video
+
+            return {"gen_rand": _generate_and_decode, "input_rand": noise, "gen_rand_train": gen_data}
         return {"gen_rand_train": gen_data}
 
     def single_train_step(

@@ -549,7 +549,12 @@ class InfiniteTalkDataset(Dataset):
                     lat = torch.load(vae_path, map_location="cpu", weights_only=False)
                     if isinstance(lat, dict):
                         lat = next(v for v in lat.values() if isinstance(v, torch.Tensor))
-                    if tuple(lat.shape) == self.expected_latent_shape:
+                    # Compare spatial dims only (C, H, W), ignoring temporal
+                    # since we slice temporal to num_latent_frames at load time.
+                    # expected: (C, T_train, H, W), stored: (C, T_stored, H, W)
+                    stored_spatial = (lat.shape[0],) + tuple(lat.shape[2:])  # (C, H, W)
+                    expected_spatial = (self.expected_latent_shape[0],) + tuple(self.expected_latent_shape[2:])
+                    if stored_spatial == expected_spatial and lat.shape[1] >= self.num_latent_frames:
                         self.dirs.append(d)
                     else:
                         shape_mismatch_count += 1
