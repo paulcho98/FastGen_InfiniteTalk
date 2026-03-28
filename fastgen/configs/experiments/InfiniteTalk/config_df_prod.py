@@ -89,14 +89,28 @@ def create_config():
         num_workers=0,  # required for lazy caching (GPU encoders)
     )
 
-    # ── No dataloader_val — iter-0 validation causes torch.compile hang with DDP ──
-    # Visual samples from training at sample_logging_iter instead.
+    # ── Validation dataloader — 10 held-out samples with audio paths ──
+    config.dataloader_val = L(InfiniteTalkDataLoader)(
+        data_list_path=os.environ.get(
+            "INFINITETALK_VAL_LIST",
+            "data/precomputed_talkvid/all_viable_val.txt",
+        ),
+        neg_text_emb_path=NEG_TEXT_EMB,
+        batch_size=1,
+        load_ode_path=False,
+        expected_latent_shape=config.model.input_shape,
+        num_video_frames=93,
+        num_latent_frames=21,
+        audio_data_root=AUDIO_DATA_ROOT,
+        num_workers=0,
+    )
 
     # ── Training schedule ──
     config.trainer.max_iter = 5000
     config.trainer.logging_iter = 1        # log loss every step
     config.trainer.save_ckpt_iter = 500
-    config.trainer.validation_iter = 999999  # disabled
+    config.trainer.validation_iter = 100   # val every 100 steps
+    config.trainer.skip_iter0_validation = True  # skip iter-0 (torch.compile hang)
 
     # ── Callbacks ──
     config.trainer.callbacks = {
