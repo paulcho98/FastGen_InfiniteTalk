@@ -216,55 +216,90 @@ def load_wav2vec(wav2vec_dir: str, device: str):
 # Video / audio loading helpers
 # ===================================================================
 
-def load_video_frames(video_path: str, frame_count: int = 81):
-    """Load ``frame_count`` frames from *video_path* using decord or imageio.
+def _resample_indices(native_fps: float, target_fps: float, frame_count: int, total_frames: int):
+    """Compute frame indices to resample from native_fps to target_fps.
+
+    For each of the ``frame_count`` output frames at ``target_fps``, find the
+    nearest frame in the source video at ``native_fps``.
 
     Returns:
-        frames: np.ndarray  [T, H, W, 3] uint8
-        fps: float
+        List[int] of length <= frame_count, clamped to [0, total_frames - 1].
+    """
+    if abs(native_fps - target_fps) < 0.5:
+        # Close enough — no resampling needed
+        return list(range(min(frame_count, total_frames)))
+    indices = []
+    for i in range(frame_count):
+        t = i / target_fps  # target timestamp in seconds
+        src_idx = round(t * native_fps)  # nearest source frame
+        if src_idx >= total_frames:
+            break
+        indices.append(src_idx)
+    return indices
+
+
+def load_video_frames(video_path: str, frame_count: int = 81, target_fps: float = 25.0):
+    """Load ``frame_count`` frames from *video_path*, resampled to ``target_fps``.
+
+    If the source video's FPS differs from ``target_fps``, frames are selected
+    at timestamps that correspond to ``target_fps`` (nearest-neighbor in time).
+    This ensures the extracted frames match the 25fps assumption used by the
+    audio embedding pipeline (wav2vec2 ``video_length = audio_duration * 25``).
+
+    Returns:
+        frames: np.ndarray  [T, H, W, 3] uint8  (T <= frame_count)
+        fps: float  (always target_fps after resampling)
     """
     # Try decord first (fast, C++ backend)
     try:
         from decord import VideoReader, cpu as decord_cpu
         vr = VideoReader(video_path, ctx=decord_cpu(0))
-        fps = float(vr.get_avg_fps())
+        native_fps = float(vr.get_avg_fps())
         total = len(vr)
-        n = min(total, frame_count)
-        indices = list(range(n))
+        indices = _resample_indices(native_fps, target_fps, frame_count, total)
         frames = vr.get_batch(indices).asnumpy()  # [T, H, W, 3]
-        return frames, fps
+        return frames, target_fps
     except Exception:
         pass
 
-    # Fallback: imageio
+    # Fallback: av (supports random access by frame index)
     try:
-        import imageio.v3 as iio
-        frames_list = []
-        meta = iio.improps(video_path, plugin="pyav")
-        fps = 25.0  # default
-        reader = iio.imiter(video_path, plugin="pyav")
-        for i, frame in enumerate(reader):
-            if i >= frame_count:
+        import av
+        container = av.open(video_path)
+        stream = container.streams.video[0]
+        native_fps = float(stream.average_rate) if stream.average_rate else target_fps
+        total = stream.frames or 10000  # fallback if metadata unavailable
+
+        # Decode all needed frames (av doesn't support efficient random access)
+        indices = _resample_indices(native_fps, target_fps, frame_count, total)
+        if not indices:
+            container.close()
+            raise RuntimeError(f"No valid frame indices for {video_path}")
+        max_idx = max(indices)
+        index_set = set(indices)
+        all_frames = {}
+        for i, frame in enumerate(container.decode(video=0)):
+            if i in index_set:
+                all_frames[i] = frame.to_ndarray(format="rgb24")
+            if i >= max_idx:
                 break
-            frames_list.append(frame)
-        frames = np.stack(frames_list, axis=0)
-        return frames, fps
+        container.close()
+        frames = np.stack([all_frames[i] for i in indices if i in all_frames], axis=0)
+        return frames, target_fps
     except Exception:
         pass
 
-    # Fallback: av
-    import av
-    container = av.open(video_path)
-    stream = container.streams.video[0]
-    fps = float(stream.average_rate) if stream.average_rate else 25.0
+    # Fallback: imageio (sequential only, no resampling possible)
+    import imageio.v3 as iio
     frames_list = []
-    for frame in container.decode(video=0):
-        if len(frames_list) >= frame_count:
+    reader = iio.imiter(video_path, plugin="pyav")
+    for i, frame in enumerate(reader):
+        if i >= frame_count:
             break
-        frames_list.append(frame.to_ndarray(format="rgb24"))
-    container.close()
+        frames_list.append(frame)
     frames = np.stack(frames_list, axis=0)
-    return frames, fps
+    logger.warning("imageio fallback: no FPS resampling applied for %s", video_path)
+    return frames, target_fps
 
 
 def resize_and_center_crop(frames: np.ndarray, target_h: int, target_w: int):
@@ -709,8 +744,8 @@ def main():
                         help="Where to write precomputed .pt files")
     parser.add_argument("--weights_dir", type=str, required=True,
                         help="InfiniteTalk weights dir (Wan2.1-I2V-14B-480P/)")
-    parser.add_argument("--wav2vec_dir", type=str, required=True,
-                        help="Path to chinese-wav2vec2-base/ directory")
+    parser.add_argument("--wav2vec_dir", type=str, default="",
+                        help="Path to chinese-wav2vec2-base/ directory (not needed with --only_vae)")
     parser.add_argument("--num_samples", type=int, default=0,
                         help="Process only first N samples (0 = all)")
     parser.add_argument("--start_idx", type=int, default=0,
@@ -725,6 +760,9 @@ def main():
                         help="Torch device for encoding")
     parser.add_argument("--neg_prompt", type=str, default=DEFAULT_NEG_PROMPT,
                         help="Negative prompt for T5 encoding")
+    parser.add_argument("--only_vae", action="store_true", default=False,
+                        help="Only load VAE encoder (skip CLIP, T5, wav2vec2). "
+                             "Use when regenerating only vae_latents.pt.")
     args = parser.parse_args()
 
     assert (args.frame_count - 1) % 4 == 0, \
@@ -758,17 +796,24 @@ def main():
     vae = load_vae(args.weights_dir, args.device)
     logger.info("  VAE loaded (%.1fs)", time.time() - t0)
 
-    t1 = time.time()
-    clip_model = load_clip(args.weights_dir, args.device)
-    logger.info("  CLIP loaded (%.1fs)", time.time() - t1)
+    if not args.only_vae:
+        t1 = time.time()
+        clip_model = load_clip(args.weights_dir, args.device)
+        logger.info("  CLIP loaded (%.1fs)", time.time() - t1)
 
-    t2 = time.time()
-    t5_encoder = load_t5(args.weights_dir, args.device)
-    logger.info("  T5 loaded (%.1fs)", time.time() - t2)
+        t2 = time.time()
+        t5_encoder = load_t5(args.weights_dir, args.device)
+        logger.info("  T5 loaded (%.1fs)", time.time() - t2)
 
-    t3 = time.time()
-    wav2vec_fe, audio_encoder = load_wav2vec(args.wav2vec_dir, args.device)
-    logger.info("  wav2vec2 loaded (%.1fs)", time.time() - t3)
+        t3 = time.time()
+        wav2vec_fe, audio_encoder = load_wav2vec(args.wav2vec_dir, args.device)
+        logger.info("  wav2vec2 loaded (%.1fs)", time.time() - t3)
+    else:
+        clip_model = None
+        t5_encoder = None
+        wav2vec_fe = None
+        audio_encoder = None
+        logger.info("  --only_vae: skipped CLIP, T5, wav2vec2")
 
     logger.info("All encoders loaded in %.1fs", time.time() - t0)
 

@@ -48,6 +48,7 @@ for gpu in $(seq 0 $((NUM_GPUS - 1))); do
         --start_idx "$START" \
         --end_idx "$END" \
         --device cuda:0 \
+        ${EXTRA_ARGS:-} \
         > "${OUTPUT_DIR}/log_gpu${gpu}.txt" 2>&1 &
     PIDS+=($!)
 done
