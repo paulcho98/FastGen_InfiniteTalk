@@ -169,6 +169,21 @@ def parse_args() -> argparse.Namespace:
         help="Audio context window size for sliding window",
     )
 
+    # Video verification output
+    parser.add_argument(
+        "--save_video", action="store_true", default=False,
+        help="Decode final denoised latent with VAE and save as MP4 with audio",
+    )
+    parser.add_argument(
+        "--video_output_dir", type=str, default=None,
+        help="Directory for decoded verification videos (default: sample_dir)",
+    )
+    parser.add_argument(
+        "--audio_dir", type=str, default=None,
+        help="Root directory to find source .wav files for audio muxing "
+             "(searches for matching sample name)",
+    )
+
     return parser.parse_args()
 
 
@@ -411,6 +426,7 @@ def extract_ode_trajectory(
     target_t_list: List[float] = None,
     device: torch.device = None,
     dtype: torch.dtype = torch.bfloat16,
+    return_final_state: bool = False,
 ) -> torch.Tensor:
     """Run teacher ODE solve with 3-call CFG and return subsampled trajectory.
 
@@ -460,10 +476,15 @@ def extract_ode_trajectory(
     # Early stopping: only run ODE steps up to the last needed subsample index.
     # The clean state (t=0.0, index -1) uses GT data["real"], not the ODE solve,
     # so we don't need to run the full solve.
-    max_needed_step = max(
-        idx for idx in subsample_indices if idx >= 0
-    )
-    actual_num_steps = min(num_steps, max_needed_step + 1)
+    # EXCEPTION: when return_final_state=True, we need the fully denoised output,
+    # so we must run all steps.
+    if return_final_state:
+        actual_num_steps = num_steps
+    else:
+        max_needed_step = max(
+            idx for idx in subsample_indices if idx >= 0
+        )
+        actual_num_steps = min(num_steps, max_needed_step + 1)
 
     # Initialize from pure noise (matching InfiniteTalk's original initialization)
     # CRITICAL: Original uses float32 for latent (line 548 of multitalk.py)
@@ -536,12 +557,175 @@ def extract_ode_trajectory(
     valid_indices = [idx for idx in subsample_indices if idx >= 0]
     subsampled = trajectory[:, valid_indices]
 
-    return subsampled.squeeze(0)  # [num_subsample, C, T, H, W]
+    result = subsampled.squeeze(0)  # [num_subsample, C, T, H, W]
+
+    if return_final_state:
+        # Return both subsampled trajectory and the final denoised state (x_t after all steps)
+        final_state = trajectory[:, -1].squeeze(0)  # [C, T, H, W]
+        return result, final_state
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model Construction
 # ─────────────────────────────────────────────────────────────────────────────
+
+def load_vae_for_decode(weights_dir: str, device):
+    """Load WanVAE for decoding latents to pixel space.
+
+    Requires mocking xformers since wan.modules.attention imports it.
+    """
+    import types
+    import importlib.machinery
+
+    class _MockModule(types.ModuleType):
+        def __getattr__(self, name):
+            if name.startswith("__") and name.endswith("__"):
+                raise AttributeError(name)
+            return lambda *a, **k: None
+
+    for p in ["xformers", "xformers.ops", "xformers.ops.fmha",
+              "xformers.ops.fmha.attn_bias"]:
+        parts = p.split(".")
+        for i in range(len(parts)):
+            partial = ".".join(parts[:i + 1])
+            if partial not in sys.modules:
+                m = _MockModule(partial)
+                if i < len(parts) - 1:
+                    m.__path__ = []
+                m.__spec__ = importlib.machinery.ModuleSpec(partial, None)
+                sys.modules[partial] = m
+
+    from flash_attn import flash_attn_func
+    sys.modules["xformers"].ops = sys.modules["xformers.ops"]
+    sys.modules["xformers.ops"].memory_efficient_attention = (
+        lambda q, k, v, attn_bias=None, op=None: flash_attn_func(q, k, v)
+    )
+
+    # Python 3.12 compat (wan/multitalk.py does `from inspect import ArgSpec`)
+    import inspect
+    if not hasattr(inspect, 'ArgSpec'):
+        inspect.ArgSpec = inspect.FullArgSpec
+
+    # Add InfiniteTalk root for wan.modules.vae
+    it_root = os.path.normpath(os.path.join(os.path.dirname(__file__), "../../InfiniteTalk"))
+    if it_root not in sys.path:
+        sys.path.insert(0, it_root)
+
+    # Mock additional deps pulled in by wan/__init__.py
+    for p in ["decord", "src.vram_management"]:
+        if p not in sys.modules:
+            m = _MockModule(p)
+            m.__spec__ = importlib.machinery.ModuleSpec(p, None)
+            sys.modules[p] = m
+    # decord.cpu and decord.VideoReader
+    sys.modules["decord"].cpu = lambda n=0: None
+    sys.modules["decord"].VideoReader = None
+
+    from wan.modules.vae import WanVAE
+    vae_path = os.path.join(weights_dir, "Wan2.1_VAE.pth")
+    logger.info(f"Loading WanVAE from {vae_path}")
+    device_str = f"cuda:{device}" if isinstance(device, int) else str(device)
+    vae = WanVAE(vae_pth=vae_path, device=device_str)
+    return vae
+
+
+def decode_and_save_video(
+    vae,
+    latent: torch.Tensor,
+    output_path: str,
+    audio_path: Optional[str] = None,
+    fps: int = 25,
+):
+    """Decode latent [C, T, H, W] with VAE and save as MP4 with optional audio."""
+    import subprocess
+    import imageio_ffmpeg
+
+    with torch.no_grad():
+        video = vae.decode(latent.unsqueeze(0).float())  # [1, C, T, H, W]
+        video = video[0].clamp(-1, 1)  # [C, T, H, W]
+
+    # [C, T, H, W] → [T, H, W, C] uint8
+    frames = video.permute(1, 2, 3, 0)
+    frames = ((frames + 1) / 2 * 255).byte().cpu().numpy()
+    num_frames, h, w, _ = frames.shape
+
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    noaudio_path = output_path.replace(".mp4", "_noaudio.mp4")
+
+    # Encode frames → MP4
+    cmd = [
+        ffmpeg_exe, "-y",
+        "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-s", f"{w}x{h}", "-pix_fmt", "rgb24", "-r", str(fps),
+        "-i", "-",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+        noaudio_path,
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    for i in range(num_frames):
+        proc.stdin.write(frames[i].tobytes())
+    proc.stdin.close()
+    proc.wait()
+
+    # Mux audio if available
+    if audio_path and os.path.exists(audio_path):
+        duration = num_frames / fps
+        mux_cmd = [
+            ffmpeg_exe, "-y",
+            "-i", noaudio_path, "-i", audio_path,
+            "-c:v", "copy", "-c:a", "aac",
+            "-t", f"{duration:.3f}", "-shortest",
+            output_path,
+        ]
+        result = subprocess.run(mux_cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            os.remove(noaudio_path)
+            logger.info(f"Saved video with audio: {output_path}")
+            return
+        else:
+            logger.warning(f"Audio mux failed: {result.stderr[:200]}")
+
+    # Fallback: rename noaudio as final output
+    os.rename(noaudio_path, output_path)
+    logger.info(f"Saved video (no audio): {output_path}")
+
+
+def find_audio_for_sample(sample_dir: str, audio_dir: Optional[str]) -> Optional[str]:
+    """Find the source .wav file for a sample based on its directory name.
+
+    Sample dir name format: data_VIDEOID_VIDEOID_START_END
+    Audio file format:      VIDEOID_START_END.wav (under audio_dir/VIDEOID/)
+    """
+    if not audio_dir:
+        return None
+    # Sample dir name: data_-0F1owya2oo_-0F1owya2oo_189664_194706
+    basename = os.path.basename(sample_dir)
+    # Remove "data_" prefix
+    if basename.startswith("data_"):
+        basename = basename[5:]
+    # basename is now: -0F1owya2oo_-0F1owya2oo_189664_194706
+    # Split on "_" but video IDs can contain "-", so find the pattern:
+    # VIDEOID appears twice, followed by START_END
+    # Just search for the wav file directly
+    wav_path = os.path.join(audio_dir, basename.split("_")[0], f"{basename}.wav")
+    if os.path.exists(wav_path):
+        return wav_path
+    # Try without the duplicate video ID: VIDEOID_START_END
+    # The video ID is everything up to the second occurrence
+    parts = basename.split("_")
+    # For "-0F1owya2oo_-0F1owya2oo_189664_194706":
+    # parts = ['-0F1owya2oo', '-0F1owya2oo', '189664', '194706']
+    # video_id = parts[0], clip = parts[0]_parts[2]_parts[3]
+    if len(parts) >= 4 and parts[0] == parts[1]:
+        video_id = parts[0]
+        clip_name = f"{video_id}_{'_'.join(parts[2:])}"
+        wav_path = os.path.join(audio_dir, video_id, f"{clip_name}.wav")
+        if os.path.exists(wav_path):
+            return wav_path
+    return None
+
 
 def resolve_base_model_paths(weights_dir: str) -> str:
     """Find Wan 2.1 I2V safetensor shards in a directory.
@@ -766,6 +950,13 @@ def main():
             f"Rank {global_rank}/{world_size}: processing {len(rank_dirs)} samples"
         )
 
+    # ── Load VAE if saving video ──
+    vae = None
+    if args.save_video:
+        vae = load_vae_for_decode(args.weights_dir, device)
+        if args.video_output_dir:
+            os.makedirs(args.video_output_dir, exist_ok=True)
+
     # ── Process samples ──
     total_time = 0.0
     success_count = 0
@@ -809,7 +1000,7 @@ def main():
 
         try:
             # Extract ODE trajectory
-            trajectory = extract_ode_trajectory(
+            ode_result = extract_ode_trajectory(
                 teacher=teacher,
                 noise_scheduler=noise_scheduler,
                 latent_shape=latent_shape,
@@ -823,15 +1014,28 @@ def main():
                 target_t_list=args.t_list,
                 device=device,
                 dtype=dtype,
+                return_final_state=args.save_video,
             )
-            # trajectory: [num_subsample, C, T, H, W]
-            # extract_ode_trajectory already filters out t=0.0 (clean state)
-            # since the clean target is vae_latents.pt, not the ODE solve.
-            ode_path = trajectory  # [num_subsample, 16, 21, H, W]
+
+            if args.save_video:
+                ode_path, final_denoised = ode_result
+            else:
+                ode_path = ode_result
 
             # Save to sample directory
             save_path = os.path.join(sample_dir, args.output_key)
             torch.save(ode_path.to(torch.bfloat16).cpu(), save_path)
+
+            # ── Decode and save video if requested ──
+            if vae is not None:
+                video_dir = args.video_output_dir or sample_dir
+                os.makedirs(video_dir, exist_ok=True)
+                sample_name = os.path.basename(sample_dir)
+                video_path = os.path.join(video_dir, f"ode_verify_{sample_name}.mp4")
+                audio_path = find_audio_for_sample(sample_dir, args.audio_dir)
+
+                decode_and_save_video(vae, final_denoised, video_path, audio_path)
+                del final_denoised
 
             t_elapsed = time.time() - t_start
             total_time += t_elapsed
@@ -852,7 +1056,7 @@ def main():
             continue
 
         # Free memory
-        del sample, trajectory, ode_path, vae_latents
+        del sample, ode_path, vae_latents
         del condition, neg_text_condition, neg_condition
         torch.cuda.empty_cache()
 

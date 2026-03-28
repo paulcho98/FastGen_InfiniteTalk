@@ -257,7 +257,7 @@ def main():
     print(f"Generated in {time.time()-t0:.0f}s")
     print(f"Output shape: {video.shape}")
 
-    # ── Save frames ──
+    # ── Save frames as PNGs ──
     os.makedirs(args.output_dir, exist_ok=True)
     for t_idx in [0, 20, 40, 60, 80]:
         if t_idx >= video.shape[1]:
@@ -267,6 +267,56 @@ def main():
         path = os.path.join(args.output_dir, f"original_pipeline_frame{t_idx}.png")
         Image.fromarray(frame).save(path)
         print(f"Saved {path}")
+
+    # ── Save full video with audio ──
+    import imageio_ffmpeg
+    import subprocess
+    import tempfile
+
+    # video tensor: [C, T, H, W] in [-1, 1] → [T, H, W, 3] uint8
+    frames_np = video.clamp(-1, 1).permute(1, 2, 3, 0)  # [T, H, W, C]
+    frames_np = ((frames_np + 1) / 2 * 255).byte().cpu().numpy()
+    num_frames = frames_np.shape[0]
+    h, w = frames_np.shape[1], frames_np.shape[2]
+    fps = 25  # InfiniteTalk default
+
+    # Write video without audio first
+    video_noaudio = os.path.join(args.output_dir, "original_pipeline_noaudio.mp4")
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    writer_cmd = [
+        ffmpeg_exe, "-y",
+        "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-s", f"{w}x{h}", "-pix_fmt", "rgb24", "-r", str(fps),
+        "-i", "-",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+        video_noaudio
+    ]
+    proc = subprocess.Popen(writer_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    for i in range(num_frames):
+        proc.stdin.write(frames_np[i].tobytes())
+    proc.stdin.close()
+    proc.wait()
+    print(f"Saved video (no audio): {video_noaudio} ({num_frames} frames, {fps}fps)")
+
+    # Mux audio
+    video_path_out = os.path.join(args.output_dir, "original_pipeline_output.mp4")
+    duration = num_frames / fps
+    mux_cmd = [
+        ffmpeg_exe, "-y",
+        "-i", video_noaudio,
+        "-i", args.audio_path,
+        "-c:v", "copy", "-c:a", "aac",
+        "-t", f"{duration:.3f}",  # trim audio to video length
+        "-shortest",
+        video_path_out
+    ]
+    result = subprocess.run(mux_cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print(f"Saved video with audio: {video_path_out}")
+        os.remove(video_noaudio)  # clean up intermediate
+    else:
+        print(f"Audio mux failed (video still saved without audio): {video_noaudio}")
+        print(f"  stderr: {result.stderr[:200]}")
 
     # Clean up
     os.remove(emb_path)

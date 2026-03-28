@@ -1523,12 +1523,18 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         context_clip = self.img_emb(clip_fea)
         context = torch.concat([context_clip, context], dim=1).to(x.dtype)
 
-        # Audio processing: process once, cache, and slice per chunk
-        if self._cached_audio is None:
-            self._cached_audio = self._process_audio(audio, device, x.dtype) if audio is not None else None
+        # Audio processing: during training, compute fresh each call so gradients
+        # flow correctly through AudioProjModel (SF exit steps need grad).
+        # During inference, cache to avoid redundant computation across chunks.
+        if self.training:
+            full_audio = self._process_audio(audio, device, x.dtype) if audio is not None else None
+        else:
+            if self._cached_audio is None:
+                self._cached_audio = self._process_audio(audio, device, x.dtype) if audio is not None else None
+            full_audio = self._cached_audio
 
         # Slice audio to current chunk's frames
-        audio_embedding = self._cached_audio
+        audio_embedding = full_audio
         if audio_embedding is not None:
             current_frame_start = current_start // frame_seqlen
             current_frame_end = current_frame_start + f

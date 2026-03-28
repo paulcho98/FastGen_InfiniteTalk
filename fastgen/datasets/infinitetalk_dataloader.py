@@ -404,6 +404,7 @@ class InfiniteTalkDataset(Dataset):
         load_ode_path: bool = False,
         num_video_frames: int = 81,
         expected_latent_shape: tuple = None,
+        audio_data_root: str = None,
         # --- Lazy caching params ---
         raw_data_root: str = None,
         csv_path: str = None,
@@ -440,6 +441,7 @@ class InfiniteTalkDataset(Dataset):
         self.load_ode_path = load_ode_path
         self.num_video_frames = num_video_frames
         self.expected_latent_shape = tuple(expected_latent_shape) if expected_latent_shape else None
+        self.audio_data_root = audio_data_root
         self._lazy_enabled = False
 
         # --- Lazy caching setup ---
@@ -786,6 +788,20 @@ class InfiniteTalkDataset(Dataset):
             "text_embeds": text_embeds,
             "neg_text_embeds": self.neg_text_embeds.clone(),
         }
+
+        # --- Source audio path (optional, for wandb video muxing) ---
+        if self.audio_data_root:
+            basename = os.path.basename(sample_dir)
+            if basename.startswith("data_"):
+                basename = basename[5:]
+            parts = basename.split("_")
+            # Format: VIDEOID_VIDEOID_START_END → audio at audio_root/VIDEOID/VIDEOID_START_END.wav
+            if len(parts) >= 4 and parts[0] == parts[1]:
+                video_id = parts[0]
+                clip_name = f"{video_id}_{'_'.join(parts[2:])}"
+                wav_path = os.path.join(self.audio_data_root, video_id, f"{clip_name}.wav")
+                if os.path.exists(wav_path):
+                    result["audio_path"] = wav_path
 
         # --- ODE trajectory (optional, for KD training) ---
         if self.load_ode_path:

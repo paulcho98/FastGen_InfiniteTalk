@@ -10,6 +10,8 @@ from the precomputed ODE trajectory data.
 
 from __future__ import annotations
 
+import os
+import sys
 from typing import Any, Dict, TYPE_CHECKING, Callable
 from functools import partial
 
@@ -36,31 +38,36 @@ class InfiniteTalkKDModel(CausalKDModel):
         super().__init__(config)
 
     def build_model(self):
-        """Build model then re-apply LoRA freeze.
-
-        FastGenModel.build_model() calls requires_grad_(True) on the entire
-        network, overriding freeze_base() from the constructor. Re-apply here.
-        """
+        """Build model, re-apply LoRA freeze, and optionally load VAE for visual logging."""
         super().build_model()
         from fastgen.networks.InfiniteTalk.lora import freeze_base
         freeze_base(self.net)
 
-    def _build_condition(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Build InfiniteTalk condition dict from data batch.
+        # Load VAE for visual sample logging
+        vae_path = getattr(self.config, "vae_path", None)
+        if vae_path and os.path.exists(vae_path):
+            self._load_vae(vae_path)
 
-        Args:
-            data: Batch from InfiniteTalkDataset with ODE paths.
+    def _load_vae(self, vae_path: str):
+        """Load WanVAE for decoding generated samples in wandb visual logging.
 
-        Returns:
-            Condition dict for InfiniteTalk networks.
+        Same implementation as InfiniteTalkDiffusionForcingModel._load_vae.
         """
-        condition = {
+        # Import from DF to avoid code duplication
+        from fastgen.methods.infinitetalk_diffusion_forcing import InfiniteTalkDiffusionForcingModel
+        InfiniteTalkDiffusionForcingModel._load_vae(self, vae_path)
+
+    # Use CausVidModel's AR sample loop for visualization (chunk-by-chunk with KV cache).
+    _student_sample_loop = CausVidModel._student_sample_loop
+
+    def _build_condition(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Build InfiniteTalk condition dict from data batch."""
+        return {
             "text_embeds": data["text_embeds"],
             "first_frame_cond": data["first_frame_cond"],
             "clip_features": data["clip_features"],
             "audio_emb": data["audio_emb"],
         }
-        return condition
 
     def _get_outputs(
         self,
@@ -68,19 +75,19 @@ class InfiniteTalkKDModel(CausalKDModel):
         input_student: torch.Tensor = None,
         condition: Any = None,
     ) -> Dict[str, torch.Tensor | Callable]:
-        noise = torch.randn_like(gen_data, dtype=self.precision)
-        context_noise = getattr(self.config, "context_noise", 0)
-        gen_rand_func = partial(
-            CausVidModel.generator_fn,
-            net=self.net_inference,
-            noise=noise,
-            condition=condition,
-            student_sample_steps=self.config.student_sample_steps,
-            t_list=self.config.sample_t_cfg.t_list,
-            context_noise=context_noise,
-            precision_amp=self.precision_amp_infer,
-        )
-        return {"gen_rand": gen_rand_func, "input_rand": noise, "gen_rand_train": gen_data}
+        if hasattr(self.net, 'vae') and condition is not None:
+            noise = torch.randn_like(gen_data, dtype=self.precision)
+            gen_rand_func = partial(
+                self.generator_fn,
+                net=self.net_inference,
+                noise=noise,
+                condition=condition,
+                student_sample_steps=self.config.student_sample_steps,
+                t_list=self.config.sample_t_cfg.t_list,
+                precision_amp=self.precision_amp_infer,
+            )
+            return {"gen_rand": gen_rand_func, "input_rand": noise, "gen_rand_train": gen_data}
+        return {"gen_rand_train": gen_data}
 
     def single_train_step(
         self, data: Dict[str, Any], iteration: int
@@ -121,6 +128,6 @@ class InfiniteTalkKDModel(CausalKDModel):
         loss = 0.5 * F.mse_loss(gen_data, denoised_data, reduction="mean")
 
         loss_map = {"total_loss": loss, "recon_loss": loss}
-        outputs = self._get_outputs(gen_data, condition=condition)
+        outputs = self._get_outputs(gen_data.detach(), condition=condition)
 
         return loss_map, outputs

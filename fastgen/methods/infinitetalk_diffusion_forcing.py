@@ -12,7 +12,9 @@ No teacher model or ODE generation needed.
 
 from __future__ import annotations
 
-from typing import Any, Dict, TYPE_CHECKING, Callable
+import os
+import sys
+from typing import Any, Dict, Optional, TYPE_CHECKING, Callable
 from functools import partial
 
 import torch
@@ -39,34 +41,81 @@ class InfiniteTalkDiffusionForcingModel(KDModel):
         super().__init__(config)
 
     def build_model(self):
-        """Build model then re-apply LoRA freeze.
-
-        The base ``FastGenModel.build_model()`` calls ``requires_grad_(True)``
-        on the entire network after instantiation, which undoes our
-        ``freeze_base()`` call in the CausalInfiniteTalkWan constructor.
-        We re-apply it here.
-        """
+        """Build model, re-apply LoRA freeze, and optionally load VAE for visual logging."""
         super().build_model()
-        # Re-freeze base weights -- FastGenModel.build_model() set requires_grad_(True) on all
         from fastgen.networks.InfiniteTalk.lora import freeze_base
         freeze_base(self.net)
 
+        # Load VAE for visual sample logging (WandbCallback decodes gen_rand with model.net.vae)
+        vae_path = getattr(self.config, "vae_path", None)
+        if vae_path and os.path.exists(vae_path):
+            self._load_vae(vae_path)
+
+    def _load_vae(self, vae_path: str):
+        """Load WanVAE for decoding generated samples in wandb visual logging."""
+        import types
+        import importlib.machinery
+
+        # Mock xformers (wan/__init__.py pulls it in transitively)
+        class _MockModule(types.ModuleType):
+            def __getattr__(self, name):
+                if name.startswith("__") and name.endswith("__"):
+                    raise AttributeError(name)
+                return lambda *a, **k: None
+
+        for p in ["xformers", "xformers.ops", "xformers.ops.fmha",
+                   "xformers.ops.fmha.attn_bias"]:
+            parts = p.split(".")
+            for i in range(len(parts)):
+                partial_name = ".".join(parts[:i + 1])
+                if partial_name not in sys.modules:
+                    m = _MockModule(partial_name)
+                    if i < len(parts) - 1:
+                        m.__path__ = []
+                    m.__spec__ = importlib.machinery.ModuleSpec(partial_name, None)
+                    sys.modules[partial_name] = m
+
+        from flash_attn import flash_attn_func
+        sys.modules["xformers"].ops = sys.modules["xformers.ops"]
+        sys.modules["xformers.ops"].memory_efficient_attention = (
+            lambda q, k, v, attn_bias=None, op=None: flash_attn_func(q, k, v)
+        )
+
+        # Mock other deps pulled by wan/__init__.py
+        import inspect
+        if not hasattr(inspect, 'ArgSpec'):
+            inspect.ArgSpec = inspect.FullArgSpec
+        for p in ["decord", "src.vram_management"]:
+            if p not in sys.modules:
+                m = _MockModule(p)
+                m.__spec__ = importlib.machinery.ModuleSpec(p, None)
+                sys.modules[p] = m
+        sys.modules["decord"].cpu = lambda n=0: None
+        sys.modules["decord"].VideoReader = None
+
+        # Add InfiniteTalk root for wan.modules.vae
+        it_root = os.path.normpath(os.path.join(os.path.dirname(__file__), "../../../InfiniteTalk"))
+        if it_root not in sys.path:
+            sys.path.insert(0, it_root)
+
+        from wan.modules.vae import WanVAE
+        device_str = f"cuda:{self.device}" if isinstance(self.device, int) else str(self.device)
+        self.net.vae = WanVAE(vae_pth=vae_path, device=device_str)
+        logger.info(f"Loaded WanVAE from {vae_path} for visual logging")
+
+    # Use CausVidModel's AR sample loop for visualization (chunk-by-chunk with KV cache).
+    # Without this, FastGenModel._student_sample_loop processes the entire video as one
+    # bidirectional pass, which doesn't reflect actual AR inference behavior.
+    _student_sample_loop = CausVidModel._student_sample_loop
+
     def _build_condition(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Build InfiniteTalk condition dict from data batch.
-
-        Args:
-            data: Batch from InfiniteTalkDataset.
-
-        Returns:
-            Condition dict for InfiniteTalk networks.
-        """
-        condition = {
+        """Build InfiniteTalk condition dict from data batch."""
+        return {
             "text_embeds": data["text_embeds"],
             "first_frame_cond": data["first_frame_cond"],
             "clip_features": data["clip_features"],
             "audio_emb": data["audio_emb"],
         }
-        return condition
 
     def _get_outputs(
         self,
@@ -74,9 +123,22 @@ class InfiniteTalkDiffusionForcingModel(KDModel):
         input_student: torch.Tensor = None,
         condition: Any = None,
     ) -> Dict[str, torch.Tensor | Callable]:
-        # Return minimal outputs to avoid holding autograd graph references
-        # during backward. The gen_rand_func closure would capture condition
-        # and keep all condition tensors alive through the backward pass.
+        # If VAE is loaded, provide a callable for multi-step visual generation.
+        has_vae = hasattr(self.net, 'vae')
+        if not has_vae:
+            logger.debug("No VAE loaded on net — visual logging disabled")
+        if has_vae and condition is not None:
+            noise = torch.randn_like(gen_data, dtype=self.precision)
+            gen_rand_func = partial(
+                self.generator_fn,
+                net=self.net_inference,
+                noise=noise,
+                condition=condition,
+                student_sample_steps=self.config.student_sample_steps,
+                t_list=self.config.sample_t_cfg.t_list,
+                precision_amp=self.precision_amp_infer,
+            )
+            return {"gen_rand": gen_rand_func, "input_rand": noise, "gen_rand_train": gen_data}
         return {"gen_rand_train": gen_data}
 
     def single_train_step(
