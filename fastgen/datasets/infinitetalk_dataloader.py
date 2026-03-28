@@ -5,13 +5,16 @@
 PyTorch Dataset for InfiniteTalk precomputed training data.
 
 Each sample directory contains precomputed .pt files:
-    - vae_latents.pt: [16, 21, H, W] — VAE-encoded 81-frame video
-    - first_frame_cond.pt: [16, 21, H, W] — VAE-encoded reference frame + zero padding
+    - vae_latents.pt: [16, T_lat, H, W] — VAE-encoded video (T_lat=24 for 93 frames, or 21 for 81)
+    - first_frame_cond.pt: [16, T_lat, H, W] — VAE-encoded reference frame + zero padding
     - clip_features.pt: [1, 257, 1280] — CLIP ViT-H/14 on reference frame
-    - audio_emb.pt: [81, 12, 768] — wav2vec2 hidden states (all 12 layers)
+    - audio_emb.pt: [T_pixel, 12, 768] — wav2vec2 hidden states (T_pixel=93 or 81)
     - text_embeds.pt: [1, 512, 4096] — T5 UMT5-XXL text embeddings
     - neg_text_embeds.pt: [1, 512, 4096] — negative text embedding (shared across samples)
-    - ode_path.pt: [num_steps, 16, 21, H, W] — ODE trajectory (KD only, optional)
+    - ode_path.pt: [num_steps, 16, T_lat, H, W] — ODE trajectory (KD only, optional)
+
+The dataloader slices to num_latent_frames (default 21) at load time, so precomputed
+data can have more frames than needed for training.
 
 Audio windowing (5-frame sliding window) is NOT applied in the dataloader.
 It is handled inside WanModel.forward() at inference time, matching InfiniteTalk's
@@ -402,7 +405,8 @@ class InfiniteTalkDataset(Dataset):
         data_list_path: str,
         neg_text_emb_path: str = None,
         load_ode_path: bool = False,
-        num_video_frames: int = 81,
+        num_video_frames: int = 93,
+        num_latent_frames: int = 21,
         expected_latent_shape: tuple = None,
         audio_data_root: str = None,
         # --- Lazy caching params ---
@@ -418,7 +422,11 @@ class InfiniteTalkDataset(Dataset):
             neg_text_emb_path: Path to shared negative text embedding file.
                 If None, uses zeros [1, 512, 4096].
             load_ode_path: If True, load ode_path.pt for KD training.
-            num_video_frames: Number of video frames (for audio truncation).
+            num_video_frames: Number of pixel frames stored on disk (for audio truncation).
+                Set to 93 (24 latent frames) for extra temporal context.
+            num_latent_frames: Number of latent frames to return for training.
+                Precomputed data may have more (e.g. 24); this slices to the
+                training length (e.g. 21). Pixel-frame equivalent = (N-1)*4+1.
             expected_latent_shape: If set, e.g. (16, 21, 56, 112), filter out samples
                 whose vae_latents.pt has a different shape. This handles datasets with
                 mixed aspect ratios — only samples matching the training resolution
@@ -440,6 +448,8 @@ class InfiniteTalkDataset(Dataset):
         """
         self.load_ode_path = load_ode_path
         self.num_video_frames = num_video_frames
+        self.num_latent_frames = num_latent_frames
+        self._train_pixel_frames = (num_latent_frames - 1) * 4 + 1  # e.g. 81 for 21 latent frames
         self.expected_latent_shape = tuple(expected_latent_shape) if expected_latent_shape else None
         self.audio_data_root = audio_data_root
         self._lazy_enabled = False
@@ -726,7 +736,9 @@ class InfiniteTalkDataset(Dataset):
         )
         if isinstance(real, dict):
             real = next(v for v in real.values() if isinstance(v, torch.Tensor))
-        real = real.to(torch.bfloat16)  # [16, 21, H, W]
+        real = real.to(torch.bfloat16)
+        # Slice to training length (precomputed data may have more latent frames)
+        real = real[:, :self.num_latent_frames]  # [16, num_latent_frames, H, W]
 
         # --- First frame conditioning ---
         first_frame_cond = torch.load(
@@ -738,11 +750,13 @@ class InfiniteTalkDataset(Dataset):
             first_frame_cond = next(
                 v for v in first_frame_cond.values() if isinstance(v, torch.Tensor)
             )
-        first_frame_cond = first_frame_cond.to(torch.bfloat16)  # [16, 21, H, W]
+        first_frame_cond = first_frame_cond.to(torch.bfloat16)
         assert first_frame_cond.shape[0] == 16, (
             f"Expected first_frame_cond with 16 channels, got {first_frame_cond.shape[0]}. "
             f"Sample: {sample_dir}"
         )
+        # Slice to training length (must match real's temporal dim)
+        first_frame_cond = first_frame_cond[:, :self.num_latent_frames]
 
         # --- CLIP features ---
         clip_features = torch.load(
@@ -770,16 +784,16 @@ class InfiniteTalkDataset(Dataset):
             audio_emb = next(
                 v for v in audio_emb.values() if isinstance(v, torch.Tensor)
             )
-        # Validate and truncate to num_video_frames
-        assert audio_emb.shape[0] >= self.num_video_frames, (
-            f"audio_emb has {audio_emb.shape[0]} frames, need >= {self.num_video_frames}. "
-            f"Sample: {sample_dir}"
-        )
+        # Validate and slice to training pixel frames
         assert audio_emb.dim() == 3 and audio_emb.shape[1:] == (12, 768), (
             f"Expected audio_emb shape [T, 12, 768], got {list(audio_emb.shape)}. "
             f"Sample: {sample_dir}"
         )
-        audio_emb = audio_emb[: self.num_video_frames]  # [81, 12, 768]
+        assert audio_emb.shape[0] >= self._train_pixel_frames, (
+            f"audio_emb has {audio_emb.shape[0]} frames, need >= {self._train_pixel_frames}. "
+            f"Sample: {sample_dir}"
+        )
+        audio_emb = audio_emb[:self._train_pixel_frames]  # [train_pixel_frames, 12, 768]
         audio_emb = audio_emb.to(torch.bfloat16)
 
         # --- Text embeddings ---

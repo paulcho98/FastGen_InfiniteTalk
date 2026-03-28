@@ -754,8 +754,9 @@ def main():
                         help="End index in CSV, exclusive (-1 = all)")
     parser.add_argument("--resolution", type=int, default=640,
                         help="Target square resolution (default 640 for 480p bucket)")
-    parser.add_argument("--frame_count", type=int, default=81,
-                        help="Number of frames to extract per video (must be 4n+1)")
+    parser.add_argument("--frame_count", type=int, default=93,
+                        help="Number of pixel frames to extract per video (must be 4n+1). "
+                             "93 frames = 24 latent frames (3 extra beyond the 21 needed for training).")
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Torch device for encoding")
     parser.add_argument("--neg_prompt", type=str, default=DEFAULT_NEG_PROMPT,
@@ -763,6 +764,9 @@ def main():
     parser.add_argument("--only_vae", action="store_true", default=False,
                         help="Only load VAE encoder (skip CLIP, T5, wav2vec2). "
                              "Use when regenerating only vae_latents.pt.")
+    parser.add_argument("--skip_clip_t5", action="store_true", default=False,
+                        help="Skip loading CLIP and T5 encoders (load VAE + wav2vec2 only). "
+                             "Use when regenerating vae_latents + audio_emb + first_frame_cond.")
     args = parser.parse_args()
 
     assert (args.frame_count - 1) % 4 == 0, \
@@ -793,10 +797,12 @@ def main():
     logger.info("Loading encoders to %s ...", args.device)
     t0 = time.time()
 
+    skip_clip_t5 = args.only_vae or args.skip_clip_t5
+
     vae = load_vae(args.weights_dir, args.device)
     logger.info("  VAE loaded (%.1fs)", time.time() - t0)
 
-    if not args.only_vae:
+    if not skip_clip_t5:
         t1 = time.time()
         clip_model = load_clip(args.weights_dir, args.device)
         logger.info("  CLIP loaded (%.1fs)", time.time() - t1)
@@ -804,16 +810,19 @@ def main():
         t2 = time.time()
         t5_encoder = load_t5(args.weights_dir, args.device)
         logger.info("  T5 loaded (%.1fs)", time.time() - t2)
+    else:
+        clip_model = None
+        t5_encoder = None
+        logger.info("  Skipped CLIP + T5")
 
+    if not args.only_vae:
         t3 = time.time()
         wav2vec_fe, audio_encoder = load_wav2vec(args.wav2vec_dir, args.device)
         logger.info("  wav2vec2 loaded (%.1fs)", time.time() - t3)
     else:
-        clip_model = None
-        t5_encoder = None
         wav2vec_fe = None
         audio_encoder = None
-        logger.info("  --only_vae: skipped CLIP, T5, wav2vec2")
+        logger.info("  Skipped wav2vec2 (--only_vae)")
 
     logger.info("All encoders loaded in %.1fs", time.time() - t0)
 
