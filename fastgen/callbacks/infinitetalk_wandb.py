@@ -95,6 +95,7 @@ class InfiniteTalkWandbCallback(WandbCallback):
     def __init__(self, *args, audio_fps: int = 25, **kwargs):
         super().__init__(*args, **kwargs)
         self.audio_fps = audio_fps
+        self._gt_logged = False  # only log GT real data once
 
     def get_sample_map(self, model, data_batch, output_batch):
         """Override to handle InfiniteTalk's standalone DiT (no init_preprocessors).
@@ -136,8 +137,8 @@ class InfiniteTalkWandbCallback(WandbCallback):
             except Exception as e:
                 logger.warning(f"Failed to log student generation to wandb: {e}")
 
-            # Also decode and log real data if VAE is available
-            if "real" in data_batch and hasattr(model.net, 'vae'):
+            # Decode and log real (GT) data only once — it doesn't change during training
+            if not self._gt_logged and "real" in data_batch and hasattr(model.net, 'vae'):
                 try:
                     from fastgen.utils.basic_utils import inference_mode
                     with inference_mode(model.net, precision_amp=model.precision_amp_enc,
@@ -148,6 +149,7 @@ class InfiniteTalkWandbCallback(WandbCallback):
                     sample_map["data/real"] = to_wandb(
                         real_decoded, fps=self.audio_fps, vid_format=self.vid_format
                     )
+                    self._gt_logged = True
                 except Exception as e:
                     logger.warning(f"Failed to decode/log real data: {e}")
 
