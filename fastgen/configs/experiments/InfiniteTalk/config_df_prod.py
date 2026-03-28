@@ -90,11 +90,12 @@ def create_config():
         num_workers=0,  # required for lazy caching (encoders can't cross process boundaries)
     )
 
-    # ── Validation dataloader — 10 held-out samples with audio paths ──
+    # ── Validation dataloader — 10 fully precomputed samples ──
+    # Must be fully precomputed (val dataloader has no lazy caching)
     config.dataloader_val = L(InfiniteTalkDataLoader)(
         data_list_path=os.environ.get(
             "INFINITETALK_VAL_LIST",
-            "data/precomputed_talkvid/all_viable_val.txt",
+            "data/precomputed_talkvid/val_precomputed.txt",
         ),
         neg_text_emb_path=NEG_TEXT_EMB,
         batch_size=1,
