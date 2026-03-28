@@ -78,6 +78,7 @@ class InfiniteTalkWandbCallback(WandbCallback):
     ) -> None:
         """Store condition + real data for deferred generation. Instant on all ranks."""
         self.val_loss_dict_record.add(loss_dict)
+        logger.info(f"[val_step_end] step={step}, rank0={is_rank0()}")
 
         if step % self.validation_logging_step != 0:
             return
@@ -92,6 +93,7 @@ class InfiniteTalkWandbCallback(WandbCallback):
             if key in data_batch:
                 condition[key] = data_batch[key][:1].detach().clone().cpu()
         self._val_conditions.append(condition)
+        logger.info(f"[val_step_end] stored condition {step}, total={len(self._val_conditions)}")
 
         if "real" in data_batch:
             self._val_real_data.append(data_batch["real"][:1].detach().clone().cpu())
@@ -113,11 +115,14 @@ class InfiniteTalkWandbCallback(WandbCallback):
             return
 
         # Generate videos from stored conditions
-        logger.info(f"Generating {len(self._val_conditions)} val videos (deferred)...")
+        logger.info(f"[val_end] Generating {len(self._val_conditions)} val videos (deferred)...")
+        import sys; sys.stdout.flush(); sys.stderr.flush()
         device = model.device
         gen_videos = []
 
-        for cond in self._val_conditions:
+        for i, cond in enumerate(self._val_conditions):
+            logger.info(f"[val_end] generating video {i+1}/{len(self._val_conditions)}...")
+            import sys; sys.stdout.flush(); sys.stderr.flush()
             try:
                 # Move condition to GPU
                 cond_gpu = {k: v.to(device) for k, v in cond.items()}
