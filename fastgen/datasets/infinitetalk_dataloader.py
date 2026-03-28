@@ -180,26 +180,50 @@ def _load_wav2vec(wav2vec_dir: str, device: str):
     return feature_extractor, audio_encoder
 
 
-def _load_video_frames(video_path: str, frame_count: int = 81):
-    """Load frames from video using av (PyAV).
+def _load_video_frames(video_path: str, frame_count: int = 93, target_fps: float = 25.0):
+    """Load frames from video, resampled to target_fps.
+
+    If the source FPS differs from target_fps, selects frames at timestamps
+    corresponding to target_fps (nearest-neighbor in time). This matches the
+    precompute script's behavior and the wav2vec2 assumption of 25fps.
 
     Returns:
-        frames: np.ndarray [T, H, W, 3] uint8
-        fps: float
+        frames: np.ndarray [T, H, W, 3] uint8 (T <= frame_count)
+        fps: float (always target_fps)
     """
     import av
 
     container = av.open(video_path)
     stream = container.streams.video[0]
-    fps = float(stream.average_rate) if stream.average_rate else 25.0
-    frames_list = []
-    for frame in container.decode(video=0):
-        if len(frames_list) >= frame_count:
+    native_fps = float(stream.average_rate) if stream.average_rate else target_fps
+    total_frames = stream.frames or 10000
+
+    # Compute which source frames to grab for target_fps output
+    if abs(native_fps - target_fps) < 0.5:
+        # Close enough — no resampling needed
+        indices = list(range(min(frame_count, total_frames)))
+    else:
+        indices = []
+        for i in range(frame_count):
+            t = i / target_fps  # target timestamp in seconds
+            src_idx = round(t * native_fps)
+            if src_idx >= total_frames:
+                break
+            indices.append(src_idx)
+
+    # Decode needed frames
+    index_set = set(indices)
+    max_idx = max(indices) if indices else 0
+    all_frames = {}
+    for i, frame in enumerate(container.decode(video=0)):
+        if i in index_set:
+            all_frames[i] = frame.to_ndarray(format="rgb24")
+        if i >= max_idx:
             break
-        frames_list.append(frame.to_ndarray(format="rgb24"))
     container.close()
-    frames = np.stack(frames_list, axis=0)
-    return frames, fps
+
+    frames = np.stack([all_frames[i] for i in indices if i in all_frames], axis=0)
+    return frames, target_fps
 
 
 def _resize_and_center_crop(frames: np.ndarray, target_h: int, target_w: int):
