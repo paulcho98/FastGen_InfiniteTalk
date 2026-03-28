@@ -108,7 +108,7 @@ def create_config():
     # ── Training schedule ──
     config.trainer.max_iter = 5000
     config.trainer.logging_iter = 1        # log loss every step
-    config.trainer.save_ckpt_iter = 500
+    config.trainer.save_ckpt_iter = 100
     config.trainer.validation_iter = 100   # val every 100 steps
     config.trainer.skip_iter0_validation = True  # skip iter-0 (torch.compile hang)
 
