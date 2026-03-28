@@ -86,7 +86,8 @@ def create_config():
         csv_path=CSV_PATH,
         weights_dir=WEIGHTS_DIR,
         wav2vec_dir=WAV2VEC_DIR,
-        num_workers=0,  # required for lazy caching (GPU encoders)
+        encode_device="cpu",  # CPU encoding avoids OOM (training uses ~77 GB of 80 GB)
+        num_workers=0,  # required for lazy caching (encoders can't cross process boundaries)
     )
 
     # ── Validation dataloader — 10 held-out samples with audio paths ──
