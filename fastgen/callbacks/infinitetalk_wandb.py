@@ -105,6 +105,11 @@ class InfiniteTalkWandbCallback(WandbCallback):
         data_batch["real"] is still a latent. We handle this by only logging gen_rand
         and skipping raw latent logging.
         """
+        # Only generate visuals on rank 0 (avoids duplicate AR generation on other ranks)
+        from fastgen.utils.distributed import is_rank0
+        if not is_rank0():
+            return {}
+
         if "gen_rand" not in output_batch:
             return {}
 

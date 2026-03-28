@@ -115,7 +115,8 @@ def create_config():
     # ── Callbacks ──
     config.trainer.callbacks = {
         "wandb": L(InfiniteTalkWandbCallback)(
-            sample_logging_iter=100,
+            sample_logging_iter=999999,    # no train visuals (val handles it)
+            validation_logging_step=1,     # visual for each val sample
             audio_fps=25,
         ),
         "train_profiler": L(TrainProfilerCallback)(every_n=100),
