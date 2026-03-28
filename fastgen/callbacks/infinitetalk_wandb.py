@@ -40,37 +40,47 @@ class InfiniteTalkWandbCallback(WandbCallback):
         t = tensor.permute(0, 2, 1, 3, 4)  # [B, C, T, H, W] → [B, T, C, H, W]
         return t.mul(127.5).add(127.5).clamp(0, 255).to(torch.uint8).cpu()
 
-    @rank0_only
     def on_dataloader_init_end(
         self, model, dataloader_train, dataloader_val, iteration: int = 0
     ) -> None:
-        """Upload GT validation videos once at the start."""
-        if dataloader_val is None or not wandb.run:
+        """Upload GT validation videos once at the start.
+
+        NOTE: NOT decorated with @rank0_only — all ranks must enter this method
+        so they all hit synchronize() at the end. Only rank 0 does the actual
+        VAE decode + wandb upload work. Without this, @rank0_only would cause
+        non-rank0 processes to skip the barrier and desync NCCL.
+        """
+        if dataloader_val is None:
+            synchronize()
             return
         if not hasattr(model.net, "vae"):
-            logger.info("No VAE loaded — skipping GT val video upload")
+            if is_rank0():
+                logger.info("No VAE loaded — skipping GT val video upload")
+            synchronize()
             return
 
-        logger.info("Uploading GT validation videos to wandb...")
-        device = model.device
-        try:
-            gt_videos = []
-            with torch.no_grad(), basic_utils.inference_mode(
-                precision_amp=model.precision_amp_enc, device_type=device.type
-            ):
-                for step, data in enumerate(dataloader_val):
-                    real = data["real"].to(device)
-                    decoded = model.net.vae.decode(real[:1].float())
-                    gt_videos.append(self._to_uint8_video(decoded))
-            gt_list = [
-                wandb.Video(v[0].numpy(), fps=self.audio_fps, format="mp4")
-                for v in gt_videos
-            ]
-            wandb.log({"val_gt/videos": gt_list}, step=0)
-            self._gt_uploaded = True
-            logger.info(f"Uploaded {len(gt_videos)} GT validation videos to wandb")
-        except Exception as e:
-            logger.warning(f"Failed to upload GT val videos: {e}")
+        if is_rank0():
+            logger.info("Uploading GT validation videos to wandb...")
+            device = model.device
+            try:
+                gt_videos = []
+                with torch.no_grad(), basic_utils.inference_mode(
+                    precision_amp=model.precision_amp_enc, device_type=device.type
+                ):
+                    for step, data in enumerate(dataloader_val):
+                        real = data["real"].to(device)
+                        decoded = model.net.vae.decode(real[:1].float())
+                        gt_videos.append(self._to_uint8_video(decoded))
+                if wandb.run:
+                    gt_list = [
+                        wandb.Video(v[0].numpy(), fps=self.audio_fps, format="mp4")
+                        for v in gt_videos
+                    ]
+                    wandb.log({"val_gt/videos": gt_list}, step=0)
+                self._gt_uploaded = True
+                logger.info(f"Uploaded {len(gt_videos)} GT validation videos to wandb")
+            except Exception as e:
+                logger.warning(f"Failed to upload GT val videos: {e}")
         synchronize()
 
     def on_validation_step_end(
