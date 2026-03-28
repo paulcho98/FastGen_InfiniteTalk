@@ -257,12 +257,16 @@ def load_sample(
         # --- VAE latents (clean video) ---
         vae_latents = _load_tensor(
             os.path.join(sample_dir, "vae_latents.pt"), dtype
-        )  # [16, 21, H, W]
+        )
+        # Slice to training length (precomputed data may have more latent frames)
+        num_latent_frames = (num_video_frames - 1) // 4 + 1  # 81 → 21, 93 → 24
+        vae_latents = vae_latents[:, :num_latent_frames]  # [16, 21, H, W]
 
         # --- First frame conditioning ---
         first_frame_cond = _load_tensor(
             os.path.join(sample_dir, "first_frame_cond.pt"), dtype
-        )  # [16, 21, H, W]
+        )
+        first_frame_cond = first_frame_cond[:, :num_latent_frames]  # [16, 21, H, W]
 
         # --- Motion frame (single-frame VAE encode for anchoring) ---
         motion_frame_path = os.path.join(sample_dir, "motion_frame.pt")
