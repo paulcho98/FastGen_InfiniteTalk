@@ -103,12 +103,10 @@ class InfiniteTalkWandbCallback(WandbCallback):
         if not hasattr(model.net, "vae"):
             return
 
-        # AR-generate student video
+        # AR-generate student video (no synchronize — only rank 0 reaches here)
         gen_rand = output_batch.get("gen_rand")
         if gen_rand is not None and isinstance(gen_rand, Callable):
-            synchronize()
             gen_rand = gen_rand()
-            synchronize()
 
         if gen_rand is None:
             return
@@ -156,7 +154,9 @@ class InfiniteTalkWandbCallback(WandbCallback):
     def get_sample_map(self, model, data_batch, output_batch):
         """Training sample map — only called for sample_logging_iter.
 
-        Returns empty since validation handles all visual logging.
+        NOTE: No synchronize() calls here. This is called from on_training_step_end
+        which runs on all ranks, but only rank 0 does actual work. synchronize()
+        would deadlock because non-rank0 returns {} before reaching the barrier.
         """
         if not is_rank0():
             return {}
@@ -167,9 +167,7 @@ class InfiniteTalkWandbCallback(WandbCallback):
         gen_rand = output_batch["gen_rand"]
 
         if isinstance(gen_rand, Callable):
-            synchronize()
             gen_rand = gen_rand()
-            synchronize()
 
         if wandb.run and gen_rand is not None:
             try:
@@ -179,7 +177,6 @@ class InfiniteTalkWandbCallback(WandbCallback):
             except Exception as e:
                 logger.warning(f"Failed to log student generation: {e}")
 
-        synchronize()
         gc.collect()
         torch.cuda.empty_cache()
         return sample_map
