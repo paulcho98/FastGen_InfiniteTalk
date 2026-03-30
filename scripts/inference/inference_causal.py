@@ -448,8 +448,219 @@ def load_wav2vec(wav2vec_path, device="cuda"):
 
 
 # ===========================================================================
-# Placeholder for Tasks 5-8 (model loading, AR loop, decode, main)
+# Diffusion model loading
 # ===========================================================================
+
+def load_diffusion_model(args, num_latent, device, dtype):
+    """Load CausalInfiniteTalkWan and apply DF/SF checkpoint."""
+    from fastgen.networks.InfiniteTalk.network_causal import CausalInfiniteTalkWan
+
+    print(f"Loading CausalInfiniteTalkWan (14B)...")
+    print(f"  base_model_paths: {args.base_model_paths.split(',')[0]}... ({len(args.base_model_paths.split(','))} shards)")
+    print(f"  infinitetalk_ckpt: {args.infinitetalk_ckpt}")
+    print(f"  lora_rank: {args.lora_rank}, lora_alpha: {args.lora_alpha}")
+    print(f"  chunk_size: {args.chunk_size}, total_num_frames: {num_latent}")
+
+    model = CausalInfiniteTalkWan(
+        base_model_paths=args.base_model_paths,
+        infinitetalk_ckpt_path=args.infinitetalk_ckpt,
+        lora_ckpt_path="",
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        chunk_size=args.chunk_size,
+        total_num_frames=num_latent,
+        net_pred_type="flow",
+        schedule_type="rf",
+        shift=7.0,
+        local_attn_size=args.local_attn_size,
+        sink_size=0,
+        use_dynamic_rope=False,
+    )
+
+    # --- Load DF/SF checkpoint overlay ---
+    if args.ckpt_path and os.path.isfile(args.ckpt_path):
+        print(f"  Loading checkpoint: {args.ckpt_path}")
+        ckpt = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
+
+        if isinstance(ckpt, dict):
+            if "model" in ckpt and isinstance(ckpt["model"], dict) and "net" in ckpt["model"]:
+                state_dict = ckpt["model"]["net"]
+            elif "net" in ckpt:
+                state_dict = ckpt["net"]
+            else:
+                state_dict = ckpt
+        else:
+            state_dict = ckpt
+
+        keys_sample = list(state_dict.keys())[:5]
+        print(f"  Checkpoint keys sample: {keys_sample}")
+
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(f"  Checkpoint loaded: {len(state_dict)} params, "
+              f"{len(missing)} missing, {len(unexpected)} unexpected")
+
+        if missing:
+            lora_missing = [k for k in missing if "lora" in k.lower()]
+            other_missing = [k for k in missing if "lora" not in k.lower()]
+            if lora_missing:
+                print(f"  WARNING: {len(lora_missing)} LoRA keys missing — "
+                      f"rank/alpha mismatch? Sample: {lora_missing[:3]}")
+            if other_missing:
+                print(f"  Other missing: {other_missing[:5]}")
+
+        del ckpt, state_dict
+    else:
+        print(f"  WARNING: No checkpoint file at {args.ckpt_path}, using base weights only")
+
+    model = model.to(device=device, dtype=dtype)
+    model.eval()
+    print(f"  Model on {device}, dtype={dtype}")
+    return model
+
+
+# ===========================================================================
+# AR inference loop
+# ===========================================================================
+
+@torch.no_grad()
+def run_inference(model, condition, num_latent_frames, chunk_size,
+                  context_noise, seed, device, dtype):
+    """Block-wise autoregressive inference — no CFG, no gradients."""
+    B = 1
+    C = 16
+    H_lat = condition["first_frame_cond"].shape[3]
+    W_lat = condition["first_frame_cond"].shape[4]
+
+    t_list = [0.999, 0.955, 0.875, 0.700, 0.0]
+
+    model.total_num_frames = num_latent_frames
+    model.clear_caches()
+
+    generator = torch.Generator(device=device).manual_seed(seed)
+    noise = torch.randn(
+        B, C, num_latent_frames, H_lat, W_lat,
+        generator=generator, device=device, dtype=dtype,
+    )
+    output = torch.zeros_like(noise)
+
+    t_list_t = torch.tensor(t_list, device=device, dtype=torch.float64)
+    num_blocks = num_latent_frames // chunk_size
+    num_denoise_steps = len(t_list_t) - 1
+
+    print(f"  AR loop: {num_blocks} blocks x {num_denoise_steps} denoising steps "
+          f"= {num_blocks * (num_denoise_steps + 1)} forward passes")
+
+    for block_idx in range(num_blocks):
+        cur_start_frame = block_idx * chunk_size
+        noisy_input = noise[:, :, cur_start_frame:cur_start_frame + chunk_size]
+
+        for step_idx in range(num_denoise_steps):
+            t_cur = t_list_t[step_idx]
+            t_next = t_list_t[step_idx + 1]
+
+            x0_pred = model(
+                noisy_input,
+                t_cur.float().expand(B),
+                condition=condition,
+                cur_start_frame=cur_start_frame,
+                store_kv=False,
+                is_ar=True,
+                fwd_pred_type="x0",
+                use_gradient_checkpointing=False,
+            )
+
+            if t_next > 0:
+                eps = torch.randn_like(x0_pred)
+                noisy_input = model.noise_scheduler.forward_process(
+                    x0_pred, eps, t_next.float().expand(B),
+                )
+            else:
+                noisy_input = x0_pred
+
+        output[:, :, cur_start_frame:cur_start_frame + chunk_size] = x0_pred
+
+        cache_input = x0_pred
+        t_cache = torch.full((B,), context_noise, device=device, dtype=dtype)
+        if context_noise > 0:
+            cache_eps = torch.randn_like(x0_pred)
+            cache_input = model.noise_scheduler.forward_process(
+                x0_pred, cache_eps,
+                torch.tensor(context_noise, device=device, dtype=torch.float64).expand(B),
+            )
+
+        model(
+            cache_input,
+            t_cache,
+            condition=condition,
+            cur_start_frame=cur_start_frame,
+            store_kv=True,
+            is_ar=True,
+            fwd_pred_type="x0",
+            use_gradient_checkpointing=False,
+        )
+
+        print(f"    Block {block_idx + 1}/{num_blocks} done "
+              f"(frames {cur_start_frame}-{cur_start_frame + chunk_size - 1})")
+
+    model.clear_caches()
+    return output
+
+
+# ===========================================================================
+# Post-processing
+# ===========================================================================
+
+@torch.no_grad()
+def decode_and_save(vae, output_latents, audio_path, output_path, fps, device):
+    """VAE decode latents -> normalize -> save video -> mux audio."""
+    import imageio
+
+    print("Decoding latents with VAE (float32)...")
+
+    latent = output_latents[0].to(device=device, dtype=torch.float32)
+    video_tensor = vae.decode([latent], device=device)
+
+    if isinstance(video_tensor, (list, tuple)):
+        video_tensor = video_tensor[0] if len(video_tensor) == 1 else torch.stack(video_tensor)
+    if video_tensor.dim() == 5:
+        video_tensor = video_tensor[0]
+
+    video = (video_tensor.clamp(-1, 1) + 1) / 2 * 255
+    video = video.permute(1, 2, 3, 0).cpu().numpy().astype(np.uint8)
+    print(f"  Decoded video: {video.shape} (T, H, W, C)")
+
+    if audio_path is not None:
+        base, ext = os.path.splitext(output_path)
+        silent_path = base + "_silent" + ext
+    else:
+        silent_path = output_path
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    writer = imageio.get_writer(silent_path, fps=fps, codec="libx264", quality=8)
+    for frame in video:
+        writer.append_data(frame)
+    writer.close()
+    print(f"  Saved silent video: {silent_path}")
+
+    if audio_path is not None:
+        duration_s = video.shape[0] / fps
+        ffmpeg = _get_ffmpeg()
+        subprocess.run([
+            ffmpeg, "-y",
+            "-i", silent_path,
+            "-i", audio_path,
+            "-c:v", "copy", "-c:a", "aac",
+            "-t", f"{duration_s:.3f}",
+            output_path,
+        ], check=True, capture_output=True)
+        if os.path.exists(output_path) and silent_path != output_path:
+            os.remove(silent_path)
+        print(f"  Muxed with audio: {output_path}")
+    else:
+        print(f"  No audio to mux. Output: {output_path}")
+
+    return output_path
+
 
 if __name__ == "__main__":
     args = parse_args()
