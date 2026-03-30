@@ -662,10 +662,127 @@ def decode_and_save(vae, output_latents, audio_path, output_path, fps, device):
     return output_path
 
 
-if __name__ == "__main__":
-    args = parse_args()
-    print(f"Args parsed. Mode: {'precomputed' if args.precomputed_dir else 'raw'}")
+# ===========================================================================
+# Main pipeline
+# ===========================================================================
 
+def main():
+    args = parse_args()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = args.dtype
+
+    print("=" * 60)
+    print("Causal InfiniteTalk Inference")
+    print("=" * 60)
+
+    # ------------------------------------------------------------------
+    # Step 1: Encode text (T5 loaded/unloaded first to save VRAM)
+    # ------------------------------------------------------------------
+    print("\n[1/5] Text encoding...")
+    text_embeds = encode_text(
+        args.prompt, args.t5_path, args.t5_tokenizer,
+        args.text_embeds_path, device=device,
+    )
+
+    # ------------------------------------------------------------------
+    # Step 2: Load VAE (kept for entire session)
+    # ------------------------------------------------------------------
+    print("\n[2/5] Loading VAE...")
+    vae = load_vae(args.vae_path, device="cpu")
+
+    # ------------------------------------------------------------------
+    # Step 3: Encode inputs (raw or precomputed)
+    # ------------------------------------------------------------------
+    print("\n[3/5] Encoding inputs...")
     if args.precomputed_dir:
         data = load_precomputed(args.precomputed_dir, args.chunk_size)
-        print(f"Loaded {data['num_latent']} latent / {data['num_video']} video frames")
+        first_frame_cond = data["first_frame_cond"]
+        clip_features = data["clip_features"]
+        audio_emb = data["audio_emb"]
+        text_embeds = data["text_embeds"]  # Override with precomputed
+        num_latent = data["num_latent"]
+        num_video = data["num_video"]
+        audio_path = data["audio_path"]
+    else:
+        # Extract reference image and audio
+        if args.video is not None:
+            pil_image, audio_path = extract_first_frame_and_audio(args.video)
+            print(f"  Extracted first frame and audio from {args.video}")
+        else:
+            from PIL import Image
+            pil_image = Image.open(args.image).convert("RGB")
+            audio_path = args.audio
+
+        # Compute generation length from audio
+        num_latent, num_video = compute_generation_length(
+            audio_path, args.num_latent_frames, args.chunk_size, args.fps
+        )
+
+        # Load encoders
+        clip_model = load_clip(args.clip_path, device=device)
+        wav2vec_fe, wav2vec_model = load_wav2vec(args.wav2vec_path, device=device)
+
+        # Encode
+        first_frame_cond = encode_reference_image(
+            vae, pil_image, num_latent, device=device
+        )
+        clip_features = encode_clip(clip_model, pil_image, device=device)
+        audio_emb = encode_audio_from_file(
+            wav2vec_fe, wav2vec_model, audio_path, num_video, device=device
+        )
+
+        # Unload encoders to free VRAM for DiT
+        del clip_model, wav2vec_fe, wav2vec_model
+        torch.cuda.empty_cache()
+        print("  Encoders unloaded, VRAM freed")
+
+    # Apply override if specified
+    if args.num_latent_frames is not None:
+        num_latent = args.num_latent_frames
+        num_video = 1 + (num_latent - 1) * 4
+        first_frame_cond = first_frame_cond[:, :, :num_latent]
+        audio_emb = audio_emb[:, :num_video]
+
+    # ------------------------------------------------------------------
+    # Step 4: Load diffusion model
+    # ------------------------------------------------------------------
+    print("\n[4/5] Loading diffusion model...")
+    model = load_diffusion_model(args, num_latent, device, dtype)
+
+    # Build condition dict — move to device
+    condition = {
+        "text_embeds": text_embeds.to(device=device, dtype=dtype),
+        "first_frame_cond": first_frame_cond.to(device=device, dtype=dtype),
+        "clip_features": clip_features.to(device=device, dtype=dtype),
+        "audio_emb": audio_emb.to(device=device, dtype=dtype),
+    }
+
+    # ------------------------------------------------------------------
+    # Step 5: Run inference + decode + save
+    # ------------------------------------------------------------------
+    print(f"\n[5/5] Running AR inference ({num_latent} latent / {num_video} video frames)...")
+    output_latents = run_inference(
+        model, condition, num_latent, args.chunk_size,
+        args.context_noise, args.seed, device, dtype,
+    )
+
+    # Free model VRAM before decode
+    del model
+    torch.cuda.empty_cache()
+
+    # Decode and save
+    print("\nDecoding and saving...")
+    output_file = decode_and_save(
+        vae, output_latents, audio_path, args.output_path, args.fps, device,
+    )
+
+    print(f"\nDone! Output: {output_file}")
+
+    # Clean up temp audio if extracted from video
+    if args.video is not None and audio_path and os.path.exists(audio_path):
+        if audio_path.startswith(tempfile.gettempdir()):
+            os.remove(audio_path)
+
+
+if __name__ == "__main__":
+    main()
