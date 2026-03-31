@@ -328,10 +328,16 @@ def encode_reference_image(vae, pil_image, num_latent, target_h=448, target_w=89
     video_padded = torch.zeros(1, 3, num_video, target_h, target_w, dtype=torch.float32)
     video_padded[0, :, 0] = img_tensor
 
+    # Move VAE to GPU for encoding
+    vae.model = vae.model.to(device)
+    vae.mean = vae.mean.to(device)
+    vae.std = vae.std.to(device)
+    vae.scale = [vae.mean, 1.0 / vae.std]
+
     vae_dtype = getattr(vae, "dtype", None) or next(vae.model.parameters()).dtype
     video_for_vae = video_padded[0].to(device=device, dtype=vae_dtype)
 
-    latent = vae.encode([video_for_vae], device=device)
+    latent = vae.encode([video_for_vae])
     if isinstance(latent, (list, tuple)):
         latent = torch.stack(latent)
     first_frame_cond = latent.to(torch.bfloat16).cpu()
@@ -617,8 +623,13 @@ def decode_and_save(vae, output_latents, audio_path, output_path, fps, device):
 
     print("Decoding latents with VAE (float32)...")
 
+    # Move VAE (model + scale tensors) to GPU for decoding
+    vae.model = vae.model.to(device)
+    vae.mean = vae.mean.to(device)
+    vae.std = vae.std.to(device)
+    vae.scale = [vae.mean, 1.0 / vae.std]
     latent = output_latents[0].to(device=device, dtype=torch.float32)
-    video_tensor = vae.decode([latent], device=device)
+    video_tensor = vae.decode([latent])
 
     if isinstance(video_tensor, (list, tuple)):
         video_tensor = video_tensor[0] if len(video_tensor) == 1 else torch.stack(video_tensor)
