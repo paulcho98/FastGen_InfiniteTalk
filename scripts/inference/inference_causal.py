@@ -82,6 +82,8 @@ def parse_args():
     # --- Input: precomputed mode ---
     p.add_argument("--precomputed_dir", type=str, default=None,
                    help="Directory with pre-computed .pt files")
+    p.add_argument("--precomputed_list", type=str, default=None,
+                   help="Text file listing precomputed dirs (one per line, for batch mode)")
 
     # --- Audio for precomputed mode ---
     p.add_argument("--audio_data_root", type=str, default=None,
@@ -91,8 +93,10 @@ def parse_args():
                    help="Explicit source audio path for muxing (any mode)")
 
     # --- Output ---
-    p.add_argument("--output_path", type=str, required=True,
-                   help="Output video path")
+    p.add_argument("--output_path", type=str, default=None,
+                   help="Output video path (single mode)")
+    p.add_argument("--output_dir", type=str, default=None,
+                   help="Output directory (batch mode — one video per sample)")
 
     # --- Model paths ---
     p.add_argument("--ckpt_path", type=str, required=True,
@@ -146,10 +150,15 @@ def parse_args():
     # Validation
     has_raw = args.image is not None or args.video is not None
     has_precomputed = args.precomputed_dir is not None
-    if not has_raw and not has_precomputed:
-        p.error("Must provide --image/--audio, --video, or --precomputed_dir")
-    if has_raw and has_precomputed:
-        p.error("Cannot use both raw inputs and --precomputed_dir")
+    has_batch = args.precomputed_list is not None
+    if not has_raw and not has_precomputed and not has_batch:
+        p.error("Must provide --image/--audio, --video, --precomputed_dir, or --precomputed_list")
+    if sum([has_raw, has_precomputed, has_batch]) > 1:
+        p.error("Cannot combine raw inputs, --precomputed_dir, and --precomputed_list")
+    if has_batch and args.output_dir is None:
+        p.error("--output_dir is required for batch mode (--precomputed_list)")
+    if not has_batch and args.output_path is None:
+        p.error("--output_path is required for single-sample mode")
     if args.image is not None and args.audio is None:
         p.error("--audio is required when using --image")
     if has_raw and args.wav2vec_path is None:
@@ -730,31 +739,38 @@ def main():
     vae = load_vae(args.vae_path, device="cpu")
 
     # ------------------------------------------------------------------
-    # Step 3: Encode inputs (raw or precomputed)
+    # Step 3: Build sample list
     # ------------------------------------------------------------------
-    print("\n[3/5] Encoding inputs...")
-    if args.precomputed_dir:
-        data = load_precomputed(args.precomputed_dir, args.chunk_size)
-        first_frame_cond = data["first_frame_cond"]
-        clip_features = data["clip_features"]
-        audio_emb = data["audio_emb"]
-        text_embeds = data["text_embeds"]  # Override with precomputed
-        num_latent = data["num_latent"]
-        num_video = data["num_video"]
-        audio_path = data["audio_path"]
-        # Resolve source audio for muxing
-        if args.source_audio:
-            audio_path = args.source_audio
-        elif args.audio_data_root:
-            audio_path = resolve_audio_for_precomputed(
-                args.precomputed_dir, args.audio_data_root
-            )
-            if audio_path:
-                print(f"  Resolved source audio: {audio_path}")
+    if args.precomputed_list:
+        # Batch mode: read list of precomputed dirs
+        list_dir = os.path.dirname(os.path.abspath(args.precomputed_list))
+        with open(args.precomputed_list) as f:
+            sample_dirs = [line.strip() for line in f if line.strip()]
+        # Resolve relative paths against the list file's location or CWD
+        resolved = []
+        for d in sample_dirs:
+            if os.path.isabs(d):
+                resolved.append(d)
+            elif os.path.isdir(d):
+                resolved.append(os.path.abspath(d))
+            elif os.path.isdir(os.path.join(list_dir, d)):
+                resolved.append(os.path.join(list_dir, d))
             else:
-                print(f"  WARNING: Could not resolve audio from {args.audio_data_root}")
+                print(f"  WARNING: skipping non-existent dir: {d}")
+        sample_dirs = resolved
+        os.makedirs(args.output_dir, exist_ok=True)
+        print(f"\n[3/5] Batch mode: {len(sample_dirs)} samples")
+    elif args.precomputed_dir:
+        sample_dirs = [args.precomputed_dir]
     else:
-        # Extract reference image and audio
+        sample_dirs = None  # raw input mode
+
+    # ------------------------------------------------------------------
+    # Step 3b: Encode raw inputs (if not precomputed)
+    # ------------------------------------------------------------------
+    raw_encoded = None
+    if sample_dirs is None:
+        print("\n[3/5] Encoding raw inputs...")
         if args.video is not None:
             pil_image, audio_path = extract_first_frame_and_audio(args.video)
             print(f"  Extracted first frame and audio from {args.video}")
@@ -763,79 +779,125 @@ def main():
             pil_image = Image.open(args.image).convert("RGB")
             audio_path = args.audio
 
-        # Compute generation length from audio
         num_latent, num_video = compute_generation_length(
             audio_path, args.num_latent_frames, args.chunk_size, args.fps
         )
 
-        # Load encoders
         clip_model = load_clip(args.clip_path, device=device)
         wav2vec_fe, wav2vec_model = load_wav2vec(args.wav2vec_path, device=device)
 
-        # Encode
-        first_frame_cond = encode_reference_image(
-            vae, pil_image, num_latent, device=device
-        )
+        first_frame_cond = encode_reference_image(vae, pil_image, num_latent, device=device)
         clip_features = encode_clip(clip_model, pil_image, device=device)
-        audio_emb = encode_audio_from_file(
-            wav2vec_fe, wav2vec_model, audio_path, num_video, device=device
-        )
+        audio_emb = encode_audio_from_file(wav2vec_fe, wav2vec_model, audio_path, num_video, device=device)
 
-        # Unload encoders to free VRAM for DiT
         del clip_model, wav2vec_fe, wav2vec_model
         torch.cuda.empty_cache()
         print("  Encoders unloaded, VRAM freed")
 
-        # Allow explicit audio override for muxing
         if args.source_audio:
             audio_path = args.source_audio
 
-    # Apply override if specified
-    if args.num_latent_frames is not None:
-        num_latent = args.num_latent_frames
-        num_video = 1 + (num_latent - 1) * 4
-        first_frame_cond = first_frame_cond[:, :, :num_latent]
-        audio_emb = audio_emb[:, :num_video]
+        if args.num_latent_frames is not None:
+            num_latent = args.num_latent_frames
+            num_video = 1 + (num_latent - 1) * 4
+            first_frame_cond = first_frame_cond[:, :, :num_latent]
+            audio_emb = audio_emb[:, :num_video]
+
+        raw_encoded = {
+            "first_frame_cond": first_frame_cond, "clip_features": clip_features,
+            "audio_emb": audio_emb, "text_embeds": text_embeds,
+            "num_latent": num_latent, "num_video": num_video,
+            "audio_path": audio_path,
+        }
+        sample_dirs = [None]  # single-item sentinel for the loop
 
     # ------------------------------------------------------------------
-    # Step 4: Load diffusion model
+    # Step 4: Load diffusion model (once)
     # ------------------------------------------------------------------
+    # Use first sample to get num_latent for initial cache allocation
+    if raw_encoded:
+        init_num_latent = raw_encoded["num_latent"]
+    else:
+        first_data = load_precomputed(sample_dirs[0], args.chunk_size)
+        init_num_latent = first_data["num_latent"]
+        del first_data
+
     print("\n[4/5] Loading diffusion model...")
-    model = load_diffusion_model(args, num_latent, device, dtype)
-
-    # Build condition dict — move to device
-    condition = {
-        "text_embeds": text_embeds.to(device=device, dtype=dtype),
-        "first_frame_cond": first_frame_cond.to(device=device, dtype=dtype),
-        "clip_features": clip_features.to(device=device, dtype=dtype),
-        "audio_emb": audio_emb.to(device=device, dtype=dtype),
-    }
+    model = load_diffusion_model(args, init_num_latent, device, dtype)
 
     # ------------------------------------------------------------------
-    # Step 5: Run inference + decode + save
+    # Step 5: Per-sample inference loop
     # ------------------------------------------------------------------
-    print(f"\n[5/5] Running AR inference ({num_latent} latent / {num_video} video frames)...")
-    output_latents = run_inference(
-        model, condition, num_latent, args.chunk_size,
-        args.context_noise, args.seed, device, dtype,
-    )
+    total = len(sample_dirs)
+    for sample_idx, sample_dir in enumerate(sample_dirs):
+        print(f"\n{'='*60}")
+        print(f"[5/5] Sample {sample_idx + 1}/{total}" +
+              (f": {os.path.basename(sample_dir)}" if sample_dir else ""))
+        print("=" * 60)
 
-    # Free model VRAM before decode
+        # Load/resolve condition tensors
+        if raw_encoded:
+            cond_data = raw_encoded
+        else:
+            cond_data = load_precomputed(sample_dir, args.chunk_size)
+            # Resolve audio
+            audio_path = None
+            if args.source_audio:
+                audio_path = args.source_audio
+            elif args.audio_data_root and sample_dir:
+                audio_path = resolve_audio_for_precomputed(sample_dir, args.audio_data_root)
+                if audio_path:
+                    print(f"  Resolved source audio: {audio_path}")
+            cond_data["audio_path"] = audio_path
+
+        num_latent = cond_data["num_latent"]
+        num_video = cond_data["num_video"]
+        audio_path = cond_data.get("audio_path")
+
+        # Override length if specified
+        if args.num_latent_frames is not None:
+            num_latent = args.num_latent_frames
+            num_video = 1 + (num_latent - 1) * 4
+
+        # Build condition dict
+        te = cond_data.get("text_embeds", text_embeds)
+        condition = {
+            "text_embeds": te.to(device=device, dtype=dtype),
+            "first_frame_cond": cond_data["first_frame_cond"][:, :, :num_latent].to(device=device, dtype=dtype),
+            "clip_features": cond_data["clip_features"].to(device=device, dtype=dtype),
+            "audio_emb": cond_data["audio_emb"][:, :num_video].to(device=device, dtype=dtype),
+        }
+
+        # Update model for variable length
+        model.total_num_frames = num_latent
+
+        # Run AR inference
+        print(f"  Running AR inference ({num_latent} latent / {num_video} video frames)...")
+        output_latents = run_inference(
+            model, condition, num_latent, args.chunk_size,
+            args.context_noise, args.seed + sample_idx, device, dtype,
+        )
+
+        # Determine output path
+        if args.output_dir:
+            name = os.path.basename(sample_dir) if sample_dir else f"sample_{sample_idx}"
+            out_path = os.path.join(args.output_dir, f"{name}.mp4")
+        else:
+            out_path = args.output_path
+
+        # Decode and save
+        print("  Decoding and saving...")
+        decode_and_save(vae, output_latents, audio_path, out_path, args.fps, device)
+        print(f"  Output: {out_path}")
+
+        # Free per-sample tensors
+        del output_latents, condition
+        torch.cuda.empty_cache()
+
+    # Cleanup
     del model
     torch.cuda.empty_cache()
-
-    # Decode and save
-    print("\nDecoding and saving...")
-    output_file = decode_and_save(
-        vae, output_latents, audio_path, args.output_path, args.fps, device,
-    )
-
-    print(f"\nDone! Output: {output_file}")
-
-    # Clean up temp audio if extracted from video
-    if args.video is not None and audio_path and os.path.exists(audio_path):
-        if audio_path.startswith(tempfile.gettempdir()):
-            os.remove(audio_path)
+    print(f"\nDone! Processed {total} sample(s).")
 
 
 if __name__ == "__main__":
