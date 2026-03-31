@@ -83,6 +83,13 @@ def parse_args():
     p.add_argument("--precomputed_dir", type=str, default=None,
                    help="Directory with pre-computed .pt files")
 
+    # --- Audio for precomputed mode ---
+    p.add_argument("--audio_data_root", type=str, default=None,
+                   help="Root dir for source audio (TalkVid/data/). "
+                        "Resolves audio from precomputed sample name.")
+    p.add_argument("--source_audio", type=str, default=None,
+                   help="Explicit source audio path for muxing (any mode)")
+
     # --- Output ---
     p.add_argument("--output_path", type=str, required=True,
                    help="Output video path")
@@ -163,6 +170,27 @@ def parse_args():
 # ===========================================================================
 # Pre-computed input loading
 # ===========================================================================
+
+def resolve_audio_for_precomputed(precomputed_dir, audio_data_root):
+    """Resolve source audio path from precomputed sample dir name.
+
+    Sample dir: data_VIDEOID_VIDEOID_START_END
+    Audio at:   audio_data_root/VIDEOID/VIDEOID_START_END.wav
+    """
+    if not audio_data_root:
+        return None
+    basename = os.path.basename(precomputed_dir)
+    if basename.startswith("data_"):
+        basename = basename[5:]
+    parts = basename.split("_")
+    if len(parts) >= 4 and parts[0] == parts[1]:
+        video_id = parts[0]
+        clip_name = f"{video_id}_{'_'.join(parts[2:])}"
+        wav_path = os.path.join(audio_data_root, video_id, f"{clip_name}.wav")
+        if os.path.exists(wav_path):
+            return wav_path
+    return None
+
 
 def load_precomputed(precomputed_dir, chunk_size):
     """Load pre-computed .pt files from a sample directory.
@@ -714,6 +742,17 @@ def main():
         num_latent = data["num_latent"]
         num_video = data["num_video"]
         audio_path = data["audio_path"]
+        # Resolve source audio for muxing
+        if args.source_audio:
+            audio_path = args.source_audio
+        elif args.audio_data_root:
+            audio_path = resolve_audio_for_precomputed(
+                args.precomputed_dir, args.audio_data_root
+            )
+            if audio_path:
+                print(f"  Resolved source audio: {audio_path}")
+            else:
+                print(f"  WARNING: Could not resolve audio from {args.audio_data_root}")
     else:
         # Extract reference image and audio
         if args.video is not None:
@@ -746,6 +785,10 @@ def main():
         del clip_model, wav2vec_fe, wav2vec_model
         torch.cuda.empty_cache()
         print("  Encoders unloaded, VRAM freed")
+
+        # Allow explicit audio override for muxing
+        if args.source_audio:
+            audio_path = args.source_audio
 
     # Apply override if specified
     if args.num_latent_frames is not None:
