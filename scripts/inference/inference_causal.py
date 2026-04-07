@@ -78,6 +78,8 @@ def parse_args():
                    help="Driving audio file path")
     p.add_argument("--video", type=str, default=None,
                    help="Video file (extract first frame + audio)")
+    p.add_argument("--video_dir", type=str, default=None,
+                   help="Directory of video files for batch inference (requires --output_dir)")
 
     # --- Input: precomputed mode ---
     p.add_argument("--precomputed_dir", type=str, default=None,
@@ -144,27 +146,38 @@ def parse_args():
                    help="Model dtype")
     p.add_argument("--fps", type=int, default=25,
                    help="Output video FPS (default: 25)")
+    p.add_argument("--quarter_res", action="store_true",
+                   help="Use quarter-resolution precomputed files (*_quarter.pt)")
+    p.add_argument("--target_h", type=int, default=448,
+                   help="Target height for raw/video encoding (default: 448)")
+    p.add_argument("--target_w", type=int, default=896,
+                   help="Target width for raw/video encoding (default: 896)")
+    p.add_argument("--no_anchor_first_frame", action="store_true",
+                   help="Disable hard-overwrite of first latent frame with clean "
+                        "reference at every denoising step (on by default to match "
+                        "original InfiniteTalk inference)")
 
     args = p.parse_args()
 
     # Validation
     has_raw = args.image is not None or args.video is not None
+    has_video_dir = args.video_dir is not None
     has_precomputed = args.precomputed_dir is not None
     has_batch = args.precomputed_list is not None
-    if not has_raw and not has_precomputed and not has_batch:
-        p.error("Must provide --image/--audio, --video, --precomputed_dir, or --precomputed_list")
-    if sum([has_raw, has_precomputed, has_batch]) > 1:
-        p.error("Cannot combine raw inputs, --precomputed_dir, and --precomputed_list")
-    if has_batch and args.output_dir is None:
-        p.error("--output_dir is required for batch mode (--precomputed_list)")
-    if not has_batch and args.output_path is None:
+    if not has_raw and not has_precomputed and not has_batch and not has_video_dir:
+        p.error("Must provide --image/--audio, --video, --video_dir, --precomputed_dir, or --precomputed_list")
+    if sum([has_raw, has_precomputed, has_batch, has_video_dir]) > 1:
+        p.error("Cannot combine raw inputs, --precomputed_dir, --precomputed_list, and --video_dir")
+    if (has_batch or has_video_dir) and args.output_dir is None:
+        p.error("--output_dir is required for batch mode (--precomputed_list or --video_dir)")
+    if not has_batch and not has_video_dir and args.output_path is None:
         p.error("--output_path is required for single-sample mode")
     if args.image is not None and args.audio is None:
         p.error("--audio is required when using --image")
-    if has_raw and args.wav2vec_path is None:
-        p.error("--wav2vec_path is required for raw input mode")
-    if has_raw and args.clip_path is None:
-        p.error("--clip_path is required for raw input mode")
+    if (has_raw or has_video_dir) and args.wav2vec_path is None:
+        p.error("--wav2vec_path is required for raw/video_dir input mode")
+    if (has_raw or has_video_dir) and args.clip_path is None:
+        p.error("--clip_path is required for raw/video_dir input mode")
     if args.prompt is not None and args.t5_path is None:
         p.error("--t5_path is required when using --prompt")
     if args.num_latent_frames is not None and args.num_latent_frames % args.chunk_size != 0:
@@ -201,11 +214,14 @@ def resolve_audio_for_precomputed(precomputed_dir, audio_data_root):
     return None
 
 
-def load_precomputed(precomputed_dir, chunk_size):
+def load_precomputed(precomputed_dir, chunk_size, quarter_res=False):
     """Load pre-computed .pt files from a sample directory.
 
     Matches the training dataloader format (infinitetalk_dataloader.py).
     Returns dict with all conditioning tensors + generation length info.
+
+    Args:
+        quarter_res: If True, prefer *_quarter.pt files (224x448 → 28x56 latent).
     """
     def _load(name):
         path = os.path.join(precomputed_dir, name)
@@ -216,12 +232,18 @@ def load_precomputed(precomputed_dir, chunk_size):
             t = next(v for v in t.values() if isinstance(v, torch.Tensor))
         return t
 
-    # Prefer _81frames variants if they exist (pre-sliced to 81 video / 21 latent)
-    first_frame_cond = _load("first_frame_cond_81frames.pt")
+    # Quarter-res: prefer *_quarter.pt files
+    if quarter_res:
+        first_frame_cond = _load("first_frame_cond_quarter.pt")
+    else:
+        first_frame_cond = None
+
+    if first_frame_cond is None:
+        first_frame_cond = _load("first_frame_cond_81frames.pt")
     if first_frame_cond is None:
         first_frame_cond = _load("first_frame_cond.pt")
-        if first_frame_cond is None:
-            raise FileNotFoundError(f"first_frame_cond.pt not found in {precomputed_dir}")
+    if first_frame_cond is None:
+        raise FileNotFoundError(f"first_frame_cond.pt not found in {precomputed_dir}")
 
     audio_emb = _load("audio_emb_81frames.pt")
     if audio_emb is None:
@@ -238,15 +260,16 @@ def load_precomputed(precomputed_dir, chunk_size):
         raise FileNotFoundError(f"text_embeds.pt not found in {precomputed_dir}")
 
     # Compute generation length from audio
-    num_video = audio_emb.shape[0]
+    # audio_emb may be [T, 12, 768] (unbatched) or [1, T, 12, 768] (batched)
+    num_video = audio_emb.shape[-3]  # T dimension (12 and 768 are always last two)
     num_latent_raw = 1 + (num_video - 1) // 4
     num_latent = (num_latent_raw // chunk_size) * chunk_size
     num_latent = max(num_latent, chunk_size)
     num_video = 1 + (num_latent - 1) * 4
 
-    # Slice tensors to computed length
-    audio_emb = audio_emb[:num_video]
-    first_frame_cond = first_frame_cond[:, :num_latent]
+    # Slice tensors to computed length (temporal dim is -3 for both)
+    audio_emb = audio_emb[..., :num_video, :, :]
+    first_frame_cond = first_frame_cond[..., :num_latent, :, :]
 
     # Ensure correct shapes: add batch dim if missing
     if first_frame_cond.dim() == 4:
@@ -264,6 +287,15 @@ def load_precomputed(precomputed_dir, chunk_size):
     print(f"  clip_features: {list(clip_features.shape)}")
     print(f"  text_embeds: {list(text_embeds.shape)}")
 
+    # Read audio path if saved by precompute script
+    audio_path = None
+    audio_path_file = os.path.join(precomputed_dir, "audio_path.txt")
+    if os.path.isfile(audio_path_file):
+        with open(audio_path_file) as f:
+            ap = f.read().strip()
+            if ap and os.path.isfile(ap):
+                audio_path = ap
+
     return {
         "first_frame_cond": first_frame_cond.to(torch.bfloat16),
         "clip_features": clip_features.to(torch.bfloat16),
@@ -271,7 +303,7 @@ def load_precomputed(precomputed_dir, chunk_size):
         "text_embeds": text_embeds.to(torch.bfloat16),
         "num_latent": num_latent,
         "num_video": num_video,
-        "audio_path": None,
+        "audio_path": audio_path,
     }
 
 
@@ -388,10 +420,18 @@ def encode_reference_image(vae, pil_image, num_latent, target_h=448, target_w=89
 
 
 @torch.no_grad()
-def encode_clip(clip_model, pil_image, device="cuda"):
+def encode_clip(clip_model, pil_image, device="cuda", target_h=448, target_w=896):
     """Encode reference image -> clip_features [1, 1, 257, 1280]."""
+    import torchvision.transforms as T
     from fastgen.datasets.infinitetalk_dataloader import _encode_clip
-    clip_features = _encode_clip(clip_model, device=device, cond_image=pil_image)
+
+    # _encode_clip expects cond_image as [1, C, 1, H, W] float32 in [-1, 1]
+    image = resize_and_center_crop(pil_image, target_h, target_w)
+    transform = T.Compose([T.ToTensor(), T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])])
+    img_tensor = transform(image)  # [3, H, W]
+    cond_image = img_tensor.unsqueeze(0).unsqueeze(2)  # [1, 3, 1, H, W]
+
+    clip_features = _encode_clip(clip_model, device=device, cond_image=cond_image)
     if isinstance(clip_features, torch.Tensor):
         clip_features = clip_features.to(torch.bfloat16).cpu()
     if clip_features.dim() == 3:
@@ -468,6 +508,9 @@ def load_vae(vae_path, device="cpu"):
 def load_clip(clip_path, device="cuda"):
     """Load CLIP ViT-H/14 visual encoder."""
     from fastgen.datasets.infinitetalk_dataloader import _load_clip
+    # _load_clip expects a directory; if given a file path, use its parent
+    if os.path.isfile(clip_path):
+        clip_path = os.path.dirname(clip_path)
     print(f"Loading CLIP from {clip_path}...")
     clip_model = _load_clip(clip_path, device=device)
     return clip_model
@@ -483,7 +526,7 @@ def load_wav2vec(wav2vec_path, device="cuda"):
         wav2vec_path, local_files_only=True
     )
     audio_encoder = Wav2Vec2Model.from_pretrained(
-        wav2vec_path, local_files_only=True
+        wav2vec_path, local_files_only=True, attn_implementation="eager"
     )
     audio_encoder = audio_encoder.to(device=device)
     audio_encoder.eval()
@@ -567,7 +610,7 @@ def load_diffusion_model(args, num_latent, device, dtype):
 
 @torch.no_grad()
 def run_inference(model, condition, num_latent_frames, chunk_size,
-                  context_noise, seed, device, dtype):
+                  context_noise, seed, device, dtype, anchor_first_frame=True):
     """Block-wise autoregressive inference — no CFG, no gradients."""
     B = 1
     C = 16
@@ -590,8 +633,13 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
     num_blocks = num_latent_frames // chunk_size
     num_denoise_steps = len(t_list_t) - 1
 
+    # Extract clean first-frame latent for optional I2V overwrite (matches original
+    # InfiniteTalk inference: multitalk.py line 711 overwrites frame 0 at every step)
+    first_frame_latent = condition["first_frame_cond"][:, :, 0:1]  # [B, 16, 1, H, W]
+
     print(f"  AR loop: {num_blocks} blocks x {num_denoise_steps} denoising steps "
-          f"= {num_blocks * (num_denoise_steps + 1)} forward passes")
+          f"= {num_blocks * (num_denoise_steps + 1)} forward passes"
+          f"{' (anchor_first_frame=ON)' if anchor_first_frame else ''}")
 
     for block_idx in range(num_blocks):
         cur_start_frame = block_idx * chunk_size
@@ -600,6 +648,11 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
         for step_idx in range(num_denoise_steps):
             t_cur = t_list_t[step_idx]
             t_next = t_list_t[step_idx + 1]
+
+            # No pre-forward input anchor: the model expects noisy input at
+            # timestep t_cur. Injecting clean latent without timestep masking
+            # creates a distribution mismatch. The network's forward() handles
+            # frame 0 via output-level replacement (matching SF training).
 
             x0_pred = model(
                 noisy_input,
@@ -611,6 +664,12 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
                 fwd_pred_type="x0",
                 use_gradient_checkpointing=False,
             )
+
+            # Network forward() already anchors frame 0 in output.
+            # This is redundant but kept as explicit safety.
+            if anchor_first_frame and cur_start_frame == 0:
+                x0_pred = x0_pred.clone()
+                x0_pred[:, :, 0:1] = first_frame_latent
 
             if t_next > 0:
                 eps = torch.randn_like(x0_pred)
@@ -762,6 +821,8 @@ def main():
         print(f"\n[3/5] Batch mode: {len(sample_dirs)} samples")
     elif args.precomputed_dir:
         sample_dirs = [args.precomputed_dir]
+    elif args.video_dir:
+        sample_dirs = None  # handled below as video_dir batch
     else:
         sample_dirs = None  # raw input mode
 
@@ -769,7 +830,51 @@ def main():
     # Step 3b: Encode raw inputs (if not precomputed)
     # ------------------------------------------------------------------
     raw_encoded = None
-    if sample_dirs is None:
+    raw_encoded_list = None  # for --video_dir batch mode
+
+    if args.video_dir:
+        # Batch video directory mode: encode all videos up front, then load model once
+        video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+        video_files = sorted([
+            os.path.join(args.video_dir, f) for f in os.listdir(args.video_dir)
+            if os.path.splitext(f)[1].lower() in video_exts
+        ])
+        if not video_files:
+            raise RuntimeError(f"No video files found in {args.video_dir}")
+        os.makedirs(args.output_dir, exist_ok=True)
+        print(f"\n[3/5] Video dir batch mode: {len(video_files)} videos in {args.video_dir}")
+
+        clip_model = load_clip(args.clip_path, device=device)
+        wav2vec_fe, wav2vec_model = load_wav2vec(args.wav2vec_path, device=device)
+
+        raw_encoded_list = []
+        for vi, vpath in enumerate(video_files):
+            vname = os.path.splitext(os.path.basename(vpath))[0]
+            print(f"  Encoding {vi+1}/{len(video_files)}: {vname}")
+            pil_image, audio_path = extract_first_frame_and_audio(vpath)
+            num_latent_v, num_video_v = compute_generation_length(
+                audio_path, args.num_latent_frames, args.chunk_size, args.fps
+            )
+            ffc = encode_reference_image(vae, pil_image, num_latent_v,
+                                         target_h=args.target_h, target_w=args.target_w, device=device)
+            cf = encode_clip(clip_model, pil_image, device=device,
+                            target_h=args.target_h, target_w=args.target_w)
+            ae = encode_audio_from_file(wav2vec_fe, wav2vec_model, audio_path, num_video_v, device=device)
+            raw_encoded_list.append({
+                "first_frame_cond": ffc.cpu(), "clip_features": cf.cpu(),
+                "audio_emb": ae.cpu(), "text_embeds": text_embeds.cpu(),
+                "num_latent": num_latent_v, "num_video": num_video_v,
+                "audio_path": audio_path, "name": vname,
+            })
+
+        del clip_model, wav2vec_fe, wav2vec_model
+        torch.cuda.empty_cache()
+        print(f"  All {len(video_files)} videos encoded, encoders unloaded")
+
+        # Set sample_dirs sentinel for the loop
+        sample_dirs = [None] * len(raw_encoded_list)
+
+    elif sample_dirs is None:
         print("\n[3/5] Encoding raw inputs...")
         if args.video is not None:
             pil_image, audio_path = extract_first_frame_and_audio(args.video)
@@ -786,8 +891,10 @@ def main():
         clip_model = load_clip(args.clip_path, device=device)
         wav2vec_fe, wav2vec_model = load_wav2vec(args.wav2vec_path, device=device)
 
-        first_frame_cond = encode_reference_image(vae, pil_image, num_latent, device=device)
-        clip_features = encode_clip(clip_model, pil_image, device=device)
+        first_frame_cond = encode_reference_image(vae, pil_image, num_latent,
+                                                     target_h=args.target_h, target_w=args.target_w, device=device)
+        clip_features = encode_clip(clip_model, pil_image, device=device,
+                                    target_h=args.target_h, target_w=args.target_w)
         audio_emb = encode_audio_from_file(wav2vec_fe, wav2vec_model, audio_path, num_video, device=device)
 
         del clip_model, wav2vec_fe, wav2vec_model
@@ -817,8 +924,10 @@ def main():
     # Use first sample to get num_latent for initial cache allocation
     if raw_encoded:
         init_num_latent = raw_encoded["num_latent"]
+    elif raw_encoded_list:
+        init_num_latent = max(d["num_latent"] for d in raw_encoded_list)
     else:
-        first_data = load_precomputed(sample_dirs[0], args.chunk_size)
+        first_data = load_precomputed(sample_dirs[0], args.chunk_size, quarter_res=args.quarter_res)
         init_num_latent = first_data["num_latent"]
         del first_data
 
@@ -831,24 +940,30 @@ def main():
     total = len(sample_dirs)
     for sample_idx, sample_dir in enumerate(sample_dirs):
         print(f"\n{'='*60}")
+        sample_name = None
+        if raw_encoded_list:
+            sample_name = raw_encoded_list[sample_idx]["name"]
+        elif sample_dir:
+            sample_name = os.path.basename(sample_dir)
         print(f"[5/5] Sample {sample_idx + 1}/{total}" +
-              (f": {os.path.basename(sample_dir)}" if sample_dir else ""))
+              (f": {sample_name}" if sample_name else ""))
         print("=" * 60)
 
         # Load/resolve condition tensors
-        if raw_encoded:
+        if raw_encoded_list:
+            cond_data = raw_encoded_list[sample_idx]
+        elif raw_encoded:
             cond_data = raw_encoded
         else:
-            cond_data = load_precomputed(sample_dir, args.chunk_size)
-            # Resolve audio
-            audio_path = None
+            cond_data = load_precomputed(sample_dir, args.chunk_size, quarter_res=args.quarter_res)
+            # Resolve audio: CLI override > precomputed audio_path.txt > audio_data_root lookup
             if args.source_audio:
-                audio_path = args.source_audio
-            elif args.audio_data_root and sample_dir:
+                cond_data["audio_path"] = args.source_audio
+            elif not cond_data.get("audio_path") and args.audio_data_root and sample_dir:
                 audio_path = resolve_audio_for_precomputed(sample_dir, args.audio_data_root)
                 if audio_path:
                     print(f"  Resolved source audio: {audio_path}")
-            cond_data["audio_path"] = audio_path
+                cond_data["audio_path"] = audio_path
 
         num_latent = cond_data["num_latent"]
         num_video = cond_data["num_video"]
@@ -873,14 +988,16 @@ def main():
 
         # Run AR inference
         print(f"  Running AR inference ({num_latent} latent / {num_video} video frames)...")
+        anchor = not args.no_anchor_first_frame
         output_latents = run_inference(
             model, condition, num_latent, args.chunk_size,
             args.context_noise, args.seed + sample_idx, device, dtype,
+            anchor_first_frame=anchor,
         )
 
         # Determine output path
         if args.output_dir:
-            name = os.path.basename(sample_dir) if sample_dir else f"sample_{sample_idx}"
+            name = sample_name or f"sample_{sample_idx}"
             out_path = os.path.join(args.output_dir, f"{name}.mp4")
         else:
             out_path = args.output_path
