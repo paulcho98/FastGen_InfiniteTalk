@@ -156,6 +156,10 @@ def parse_args():
                    help="Disable hard-overwrite of first latent frame with clean "
                         "reference at every denoising step (on by default to match "
                         "original InfiniteTalk inference)")
+    p.add_argument("--preprocess_mode", type=str, default="crop",
+                   choices=["crop", "pad"],
+                   help="Preprocessing for raw/video inputs: 'crop' = resize+center-crop "
+                        "(default), 'pad' = resize to short side + zero-pad to target")
 
     args = p.parse_args()
 
@@ -374,12 +378,39 @@ def resize_and_center_crop(image, target_h, target_w):
     return image
 
 
+def resize_and_pad(image, target_h, target_w):
+    """Resize PIL image to fit target height, zero-pad width to target."""
+    from PIL import Image as PILImage
+
+    orig_w, orig_h = image.size
+    scale = target_h / orig_h
+    new_h = target_h
+    new_w = round(orig_w * scale)
+    image = image.resize((new_w, new_h), PILImage.LANCZOS)
+
+    if new_w < target_w:
+        padded = PILImage.new("RGB", (target_w, target_h), (0, 0, 0))
+        padded.paste(image, ((target_w - new_w) // 2, 0))
+        return padded
+    elif new_w > target_w:
+        left = (new_w - target_w) // 2
+        return image.crop((left, 0, left + target_w, target_h))
+    return image
+
+
+def preprocess_image(image, target_h, target_w, mode="crop"):
+    """Dispatch to crop or pad preprocessing."""
+    if mode == "pad":
+        return resize_and_pad(image, target_h, target_w)
+    return resize_and_center_crop(image, target_h, target_w)
+
+
 # ===========================================================================
 # Encoding functions
 # ===========================================================================
 
 @torch.no_grad()
-def encode_reference_image(vae, pil_image, num_latent, target_h=448, target_w=896, device="cuda"):
+def encode_reference_image(vae, pil_image, num_latent, target_h=448, target_w=896, device="cuda", preprocess_mode="crop"):
     """Encode reference image -> first_frame_cond [1, 16, T_lat, H_lat, W_lat].
 
     Builds the padded first-frame tensor: VAE-encode(ref_frame + zeros),
@@ -387,7 +418,7 @@ def encode_reference_image(vae, pil_image, num_latent, target_h=448, target_w=89
     """
     import torchvision.transforms as T
 
-    image = resize_and_center_crop(pil_image, target_h, target_w)
+    image = preprocess_image(pil_image, target_h, target_w, mode=preprocess_mode)
 
     transform = T.Compose([T.ToTensor(), T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])])
     img_tensor = transform(image)  # [3, H, W]
@@ -420,13 +451,13 @@ def encode_reference_image(vae, pil_image, num_latent, target_h=448, target_w=89
 
 
 @torch.no_grad()
-def encode_clip(clip_model, pil_image, device="cuda", target_h=448, target_w=896):
+def encode_clip(clip_model, pil_image, device="cuda", target_h=448, target_w=896, preprocess_mode="crop"):
     """Encode reference image -> clip_features [1, 1, 257, 1280]."""
     import torchvision.transforms as T
     from fastgen.datasets.infinitetalk_dataloader import _encode_clip
 
     # _encode_clip expects cond_image as [1, C, 1, H, W] float32 in [-1, 1]
-    image = resize_and_center_crop(pil_image, target_h, target_w)
+    image = preprocess_image(pil_image, target_h, target_w, mode=preprocess_mode)
     transform = T.Compose([T.ToTensor(), T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])])
     img_tensor = transform(image)  # [3, H, W]
     cond_image = img_tensor.unsqueeze(0).unsqueeze(2)  # [1, 3, 1, H, W]
@@ -656,7 +687,7 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
 
             x0_pred = model(
                 noisy_input,
-                t_cur.float().expand(B),
+                t_cur.expand(B),  # keep float64 to match _student_sample_loop
                 condition=condition,
                 cur_start_frame=cur_start_frame,
                 store_kv=False,
@@ -674,7 +705,7 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
             if t_next > 0:
                 eps = torch.randn_like(x0_pred)
                 noisy_input = model.noise_scheduler.forward_process(
-                    x0_pred, eps, t_next.float().expand(B),
+                    x0_pred, eps, t_next.expand(B),
                 )
             else:
                 noisy_input = x0_pred
@@ -856,9 +887,11 @@ def main():
                 audio_path, args.num_latent_frames, args.chunk_size, args.fps
             )
             ffc = encode_reference_image(vae, pil_image, num_latent_v,
-                                         target_h=args.target_h, target_w=args.target_w, device=device)
+                                         target_h=args.target_h, target_w=args.target_w, device=device,
+                                         preprocess_mode=args.preprocess_mode)
             cf = encode_clip(clip_model, pil_image, device=device,
-                            target_h=args.target_h, target_w=args.target_w)
+                            target_h=args.target_h, target_w=args.target_w,
+                            preprocess_mode=args.preprocess_mode)
             ae = encode_audio_from_file(wav2vec_fe, wav2vec_model, audio_path, num_video_v, device=device)
             raw_encoded_list.append({
                 "first_frame_cond": ffc.cpu(), "clip_features": cf.cpu(),
@@ -892,9 +925,11 @@ def main():
         wav2vec_fe, wav2vec_model = load_wav2vec(args.wav2vec_path, device=device)
 
         first_frame_cond = encode_reference_image(vae, pil_image, num_latent,
-                                                     target_h=args.target_h, target_w=args.target_w, device=device)
+                                                     target_h=args.target_h, target_w=args.target_w, device=device,
+                                                     preprocess_mode=args.preprocess_mode)
         clip_features = encode_clip(clip_model, pil_image, device=device,
-                                    target_h=args.target_h, target_w=args.target_w)
+                                    target_h=args.target_h, target_w=args.target_w,
+                                    preprocess_mode=args.preprocess_mode)
         audio_emb = encode_audio_from_file(wav2vec_fe, wav2vec_model, audio_path, num_video, device=device)
 
         del clip_model, wav2vec_fe, wav2vec_model

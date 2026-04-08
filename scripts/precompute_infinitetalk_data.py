@@ -581,16 +581,17 @@ def encode_audio(feature_extractor, audio_encoder, audio_array,
 # Main loop
 # ===================================================================
 
-def output_complete(sample_dir: str):
+def output_complete(sample_dir: str, quarter_res: bool = False):
     """Return True if all expected output files exist for a sample."""
+    vae_suffix = "_quarter" if quarter_res else ""
     required = [
-        "vae_latents.pt",
-        "first_frame_cond.pt",
-        "motion_frame.pt",
-        "clip_features.pt",
-        "audio_emb.pt",
-        "text_embeds.pt",
+        f"vae_latents{vae_suffix}.pt",
+        f"first_frame_cond{vae_suffix}.pt",
+        f"motion_frame{vae_suffix}.pt",
     ]
+    if not quarter_res:
+        # Full-res also needs CLIP/T5/audio
+        required += ["clip_features.pt", "audio_emb.pt", "text_embeds.pt"]
     return all(os.path.isfile(os.path.join(sample_dir, f)) for f in required)
 
 
@@ -606,6 +607,7 @@ def process_sample(
     device: str,
     resolution: int,
     frame_count: int,
+    quarter_res: bool = False,
 ):
     """Process a single sample: encode all modalities and save."""
     video_rel = row["video_path"]
@@ -614,7 +616,7 @@ def process_sample(
     sample_name = os.path.splitext(video_rel.replace("/", "_"))[0]
 
     sample_dir = os.path.join(output_dir, sample_name)
-    if output_complete(sample_dir):
+    if output_complete(sample_dir, quarter_res=quarter_res):
         logger.info("  Skipping (already complete): %s", sample_name)
         return True
 
@@ -639,21 +641,32 @@ def process_sample(
         '2.00': [896, 448],  '2.50': [960, 384],  '2.83': [1088, 384],
         '3.60': [1152, 320], '3.80': [1216, 320],  '4.00': [1280, 320],
     }
+    ASPECT_RATIO_627_QUARTER = {
+        k: [h // 2, w // 2] for k, [h, w] in ASPECT_RATIO_627.items()
+    }
     src_h = int(row.get("height", resolution))
     src_w = int(row.get("width", resolution))
     ratio = src_h / src_w
-    closest_bucket = sorted(ASPECT_RATIO_627.keys(), key=lambda x: abs(float(x) - ratio))[0]
-    target_h, target_w = ASPECT_RATIO_627[closest_bucket]
+    buckets = ASPECT_RATIO_627_QUARTER if quarter_res else ASPECT_RATIO_627
+    closest_bucket = sorted(buckets.keys(), key=lambda x: abs(float(x) - ratio))[0]
+    target_h, target_w = buckets[closest_bucket]
+
+    vae_suffix = "_quarter" if quarter_res else ""
 
     # Per-file skip: only compute what's missing
     def _exists(name):
         return os.path.isfile(os.path.join(sample_dir, name))
 
-    need_vae = not _exists("vae_latents.pt")
-    need_ffc = not _exists("first_frame_cond.pt")
+    need_vae = not _exists(f"vae_latents{vae_suffix}.pt")
+    need_ffc = not _exists(f"first_frame_cond{vae_suffix}.pt")
+    need_motion = not _exists(f"motion_frame{vae_suffix}.pt")
     need_clip = not _exists("clip_features.pt")
     need_t5 = not _exists("text_embeds.pt")
     need_audio = not _exists("audio_emb.pt")
+
+    # In quarter_res mode, CLIP/T5/audio are resolution-independent —
+    # only skip if they already exist (the _exists checks above handle this).
+    # Only skip if --only_vae or --skip_clip_t5 flags are set (handled by encoder loading).
 
     # Video loading + PIL first frame needed for VAE, first_frame_cond, or CLIP
     need_video = need_vae or need_ffc or need_clip
@@ -680,18 +693,30 @@ def process_sample(
         cond_image = resize_and_centercrop_pil(first_frame_pil, target_h, target_w)
         # cond_image: [1, C, 1, H, W] float32 in [-1, 1]
 
+        # Save pixel-space preview for visual verification
+        if quarter_res:
+            preview_path = os.path.join(sample_dir, "preview_quarter.png")
+            if not os.path.exists(preview_path):
+                from PIL import Image as PILImage
+                first_frame_pixels = ((video_tensor[:, 0] + 1) / 2 * 255).clamp(0, 255).byte()
+                first_frame_pixels = first_frame_pixels.permute(1, 2, 0).numpy()
+                PILImage.fromarray(first_frame_pixels).save(preview_path)
+                logger.info("  Saved quarter-res preview: %s (%dx%d)", preview_path, target_w, target_h)
+
     # ---- VAE encode ----
-    need_motion = not _exists("motion_frame.pt")
     if need_vae or need_ffc or need_motion:
         logger.info("  Encoding VAE...")
         latents, first_frame_cond, motion_frame = encode_vae(
             vae, video_tensor, device, cond_image=cond_image)
+        logger.info("  VAE: pixel [3, %d, %d, %d] → latent %s%s",
+                    video_tensor.shape[1], video_tensor.shape[2], video_tensor.shape[3],
+                    list(latents.shape), " (quarter)" if quarter_res else "")
         if need_vae:
-            torch.save(latents, os.path.join(sample_dir, "vae_latents.pt"))
+            torch.save(latents, os.path.join(sample_dir, f"vae_latents{vae_suffix}.pt"))
         if need_ffc:
-            torch.save(first_frame_cond, os.path.join(sample_dir, "first_frame_cond.pt"))
+            torch.save(first_frame_cond, os.path.join(sample_dir, f"first_frame_cond{vae_suffix}.pt"))
         if need_motion:
-            torch.save(motion_frame, os.path.join(sample_dir, "motion_frame.pt"))
+            torch.save(motion_frame, os.path.join(sample_dir, f"motion_frame{vae_suffix}.pt"))
         del latents, first_frame_cond, motion_frame
         torch.cuda.empty_cache()
     else:
@@ -767,6 +792,10 @@ def main():
     parser.add_argument("--skip_clip_t5", action="store_true", default=False,
                         help="Skip loading CLIP and T5 encoders (load VAE + wav2vec2 only). "
                              "Use when regenerating vae_latents + audio_emb + first_frame_cond.")
+    parser.add_argument("--quarter_res", action="store_true", default=False,
+                        help="Halve spatial dimensions before VAE encoding. "
+                             "Saves as *_quarter.pt alongside full-res files. "
+                             "Skips CLIP/T5/audio (resolution-independent).")
     args = parser.parse_args()
 
     assert (args.frame_count - 1) % 4 == 0, \
@@ -845,7 +874,7 @@ def main():
     for idx, row in enumerate(rows):
         sample_name = os.path.splitext(row["video_path"].replace("/", "_"))[0]
         sample_dir = os.path.join(args.output_dir, sample_name)
-        if output_complete(sample_dir):
+        if output_complete(sample_dir, quarter_res=args.quarter_res):
             logger.info("[%d/%d] Skipping (complete): %s", idx + 1, len(rows), sample_name)
             skipped += 1
             continue
@@ -866,6 +895,7 @@ def main():
                 device=args.device,
                 resolution=args.resolution,
                 frame_count=args.frame_count,
+                quarter_res=args.quarter_res,
             )
             elapsed = time.time() - t_sample
             if ok:
