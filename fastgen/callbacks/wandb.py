@@ -122,6 +122,7 @@ def init_wandb(config: BaseConfig):
         dir=wandb_config.save_path,
         resume="allow",
         mode=wandb_config.wandb_mode,
+        settings=wandb.Settings(init_timeout=300),
     )
 
     # Save a copy of code to a wandb Artifact (this can be slow)

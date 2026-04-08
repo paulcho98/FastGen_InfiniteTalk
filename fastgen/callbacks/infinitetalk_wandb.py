@@ -9,9 +9,11 @@ generate videos in on_validation_end (after DDP loop).
 
 import gc
 import os
+import tempfile
 from typing import Optional, Callable
 from functools import partial
 
+import numpy as np
 import torch
 import wandb
 
@@ -29,8 +31,78 @@ class InfiniteTalkWandbCallback(WandbCallback):
         # Store val data for deferred video generation
         self._val_conditions: list[dict] = []
         self._val_real_data: list[torch.Tensor] = []
+        self._val_audio_paths: list[Optional[str]] = []
         self._gt_uploaded = False
         self._model_ref = None  # set during validation
+
+    @staticmethod
+    def _mux_video_audio(video_uint8: np.ndarray, audio_path: str, fps: int) -> Optional[str]:
+        """Write video+audio to a temp MP4 file via raw ffmpeg piping.
+
+        Args:
+            video_uint8: [T, C, H, W] uint8 numpy array (from _to_uint8_video)
+        Returns:
+            Path to muxed MP4, or None on failure. Caller must clean up.
+        """
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except ImportError:
+            return None
+
+        import subprocess
+
+        # Convert [T, C, H, W] → [T, H, W, C] for raw piping
+        if video_uint8.ndim == 4 and video_uint8.shape[1] == 3:
+            frames = np.transpose(video_uint8, (0, 2, 3, 1))
+        else:
+            frames = video_uint8
+        num_frames, h, w, _ = frames.shape
+
+        tmp_dir = tempfile.mkdtemp()
+        noaudio_path = os.path.join(tmp_dir, "noaudio.mp4")
+        output_path = os.path.join(tmp_dir, "with_audio.mp4")
+
+        try:
+            # Encode raw frames → silent H.264 via stdin pipe
+            cmd = [
+                ffmpeg_exe, "-y",
+                "-f", "rawvideo", "-vcodec", "rawvideo",
+                "-s", f"{w}x{h}", "-pix_fmt", "rgb24", "-r", str(fps),
+                "-i", "-",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+                noaudio_path,
+            ]
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+            for i in range(num_frames):
+                proc.stdin.write(frames[i].tobytes())
+            proc.stdin.close()
+            proc.wait()
+
+            # Mux audio
+            duration = num_frames / fps
+            mux_cmd = [
+                ffmpeg_exe, "-y",
+                "-i", noaudio_path, "-i", audio_path,
+                "-c:v", "copy", "-c:a", "aac",
+                "-t", f"{duration:.3f}", "-shortest",
+                output_path,
+            ]
+            result = subprocess.run(mux_cmd, capture_output=True, timeout=30)
+
+            # Clean up intermediate
+            if os.path.exists(noaudio_path):
+                os.unlink(noaudio_path)
+
+            if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                return output_path
+        except Exception as e:
+            logger.warning(f"Audio muxing failed: {e}")
+
+        # Cleanup on failure
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
 
     @staticmethod
     def _to_uint8_video(tensor: torch.Tensor) -> torch.Tensor:
@@ -98,6 +170,14 @@ class InfiniteTalkWandbCallback(WandbCallback):
         if "real" in data_batch:
             self._val_real_data.append(data_batch["real"][:1].detach().clone().cpu())
 
+        # Store audio path for muxing (if available from dataloader)
+        audio_path = data_batch.get("audio_path")
+        if audio_path is not None:
+            # audio_path comes as a list/tuple from collation
+            self._val_audio_paths.append(audio_path[0] if isinstance(audio_path, (list, tuple)) else audio_path)
+        else:
+            self._val_audio_paths.append(None)
+
     def on_validation_end(self, model, iteration: int = 0, idx: int = 0) -> None:
         """Log val loss + generate all videos AFTER DDP loop completes."""
         self.log_stats(self.val_loss_dict_record, iteration=iteration, group=f"val{idx}")
@@ -105,24 +185,24 @@ class InfiniteTalkWandbCallback(WandbCallback):
         if not is_rank0() or not self._val_conditions:
             self._val_conditions = []
             self._val_real_data = []
+            self._val_audio_paths = []
             self._model_ref = None
             return
 
         if not wandb.run or not hasattr(model.net, "vae"):
             self._val_conditions = []
             self._val_real_data = []
+            self._val_audio_paths = []
             self._model_ref = None
             return
 
         # Generate videos from stored conditions
         logger.info(f"[val_end] Generating {len(self._val_conditions)} val videos (deferred)...")
-        import sys; sys.stdout.flush(); sys.stderr.flush()
         device = model.device
         gen_videos = []
 
         for i, cond in enumerate(self._val_conditions):
             logger.info(f"[val_end] generating video {i+1}/{len(self._val_conditions)}...")
-            import sys; sys.stdout.flush(); sys.stderr.flush()
             try:
                 # Move condition to GPU
                 cond_gpu = {k: v.to(device) for k, v in cond.items()}
@@ -153,7 +233,20 @@ class InfiniteTalkWandbCallback(WandbCallback):
                 traceback.print_exc()
 
         if gen_videos:
-            gen_list = [wandb.Video(v[0].numpy(), fps=self.audio_fps, format="mp4") for v in gen_videos]
+            # Build wandb Video objects, muxing audio when available
+            gen_list = []
+            tmp_files = []
+            for vi, v in enumerate(gen_videos):
+                video_np = v[0].numpy()  # [T, C, H, W] uint8
+                audio_path = self._val_audio_paths[vi] if vi < len(self._val_audio_paths) else None
+                if audio_path and os.path.exists(audio_path):
+                    muxed = self._mux_video_audio(video_np, audio_path, self.audio_fps)
+                    if muxed:
+                        gen_list.append(wandb.Video(muxed, fps=self.audio_fps, format="mp4"))
+                        tmp_files.append(muxed)
+                        continue
+                gen_list.append(wandb.Video(video_np, fps=self.audio_fps, format="mp4"))
+
             log_dict = {f"val{idx}/generated": gen_list}
 
             # Decode GT on first validation if not uploaded at init
@@ -166,9 +259,18 @@ class InfiniteTalkWandbCallback(WandbCallback):
                         for real in self._val_real_data:
                             decoded = model.net.vae.decode(real.to(device).float())
                             gt_videos.append(self._to_uint8_video(decoded))
-                    log_dict[f"val{idx}/reconstructed"] = [
-                        wandb.Video(v[0].numpy(), fps=self.audio_fps, format="mp4") for v in gt_videos
-                    ]
+                    gt_list = []
+                    for vi, v in enumerate(gt_videos):
+                        video_np = v[0].numpy()
+                        audio_path = self._val_audio_paths[vi] if vi < len(self._val_audio_paths) else None
+                        if audio_path and os.path.exists(audio_path):
+                            muxed = self._mux_video_audio(video_np, audio_path, self.audio_fps)
+                            if muxed:
+                                gt_list.append(wandb.Video(muxed, fps=self.audio_fps, format="mp4"))
+                                tmp_files.append(muxed)
+                                continue
+                        gt_list.append(wandb.Video(video_np, fps=self.audio_fps, format="mp4"))
+                    log_dict[f"val{idx}/reconstructed"] = gt_list
                     self._gt_uploaded = True
                 except Exception as e:
                     logger.warning(f"Failed to decode GT: {e}")
@@ -176,8 +278,16 @@ class InfiniteTalkWandbCallback(WandbCallback):
             wandb.log(log_dict, step=iteration)
             logger.info(f"Logged {len(gen_videos)} val videos at iteration {iteration}")
 
+            # Clean up temp muxed files
+            for tf in tmp_files:
+                try:
+                    os.unlink(tf)
+                except OSError:
+                    pass
+
         self._val_conditions = []
         self._val_real_data = []
+        self._val_audio_paths = []
         self._model_ref = None
         gc.collect()
         torch.cuda.empty_cache()
