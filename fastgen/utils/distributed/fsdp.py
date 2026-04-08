@@ -64,6 +64,79 @@ def apply_fsdp_checkpointing(module: torch.nn.Module, check_fn: Optional[Callabl
     apply_activation_checkpointing(module, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn)
 
 
+import gc
+
+
+def fsdp_shard_single_network(
+    network: torch.nn.Module,
+    name: str,
+    precision: torch.dtype,
+    precision_fsdp: torch.dtype,
+    min_num_params: int = 10_000_000,
+    apply_cpu_offload: bool = False,
+    sharding_group_size: Optional[int] = None,
+):
+    """FSDP-shard a single network and move it to GPU, freeing CPU memory.
+
+    Use this to sequentially build and shard large models (e.g., 3x 14B)
+    without holding all models in CPU RAM simultaneously.
+
+    Args:
+        network: The network module to shard.
+        name: Name for logging (e.g., 'net', 'teacher', 'fake_score').
+        precision: Compute precision (e.g., torch.bfloat16).
+        precision_fsdp: Parameter storage precision for FSDP shards.
+        min_num_params: Minimum params for auto-wrap fallback.
+        apply_cpu_offload: Whether to use CPU offloading.
+        sharding_group_size: Optional sharding group size for 2D mesh.
+    """
+    total_world_size = world_size()
+    if sharding_group_size is None:
+        device_mesh = init_device_mesh("cuda", (total_world_size,))
+    else:
+        replica_group_size = total_world_size // sharding_group_size
+        device_mesh = init_device_mesh(
+            "cuda", (replica_group_size, sharding_group_size), mesh_dim_names=("replicate", "shard")
+        )
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=precision,
+        reduce_dtype=torch.float32,  # Always reduce gradients in fp32 for numerical stability
+        output_dtype=None,
+        cast_forward_inputs=False,
+    )
+    offload_policy = CPUOffloadPolicy() if apply_cpu_offload else None
+
+    num_params = sum(p.numel() for p in network.parameters()) / 1e9
+    logger.info(f"[sequential_init] FSDP sharding '{name}' ({num_params:.2f}B params)...")
+    t0 = time.time()
+
+    # Cast to FSDP storage precision before sharding
+    network.to(dtype=precision_fsdp)
+
+    # Apply fully_shard
+    if isinstance(network, FastGenNetwork):
+        network.fully_shard(mesh=device_mesh, mp_policy=mp_policy, offload_policy=offload_policy)
+    else:
+        modules_to_shard = _get_submodules_to_shard(network, min_num_params)
+        for submodule in modules_to_shard:
+            fully_shard(submodule, mesh=device_mesh, mp_policy=mp_policy,
+                        offload_policy=offload_policy, reshard_after_forward=True)
+        fully_shard(network, mesh=device_mesh, mp_policy=mp_policy,
+                    offload_policy=offload_policy, reshard_after_forward=True)
+
+    # Move to GPU
+    target_device = "cpu" if apply_cpu_offload else torch.cuda.current_device()
+    network.to(device=target_device)
+    synchronize()
+
+    # Free CPU memory
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    logger.info(f"[sequential_init] FSDP sharded '{name}' in {time.time() - t0:.1f}s")
+
+
 def model_to_fsdp(
     model: FastGenModel,
     min_num_params: int = 10_000_000,
@@ -211,6 +284,14 @@ def model_to_fsdp(
         else:
             v.to(device=target_device)
         synchronize()
+
+        # Free CPU memory after sharding each network.
+        # Critical for large multi-model setups (e.g., 3x 14B) where all models
+        # are built on CPU before FSDP wrapping. After to(device=cuda), the
+        # original CPU parameter storage can be collected.
+        gc.collect()
+        torch.cuda.empty_cache()
+
         logger.info(f"FSDP2 wrapped {k} in {time.time() - t0:.1f}s")
 
     return model

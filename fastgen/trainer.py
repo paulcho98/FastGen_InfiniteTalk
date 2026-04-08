@@ -80,8 +80,15 @@ class Trainer:
         logger.info("Initializing callbacks and model ...")
         self.callbacks.on_model_init_start(model)
         if self.config.trainer.checkpointer.pretrained_ckpt_path:
-            # This typically only affects the first job in the auto-resume chain
-            self.load_pretrained_ckpt(model)
+            # Skip if sequential init already loaded pretrained weights during build_model
+            if getattr(model, "_fsdp_already_wrapped", False):
+                logger.info("Skipping pretrained ckpt load (sequential init already loaded in build_model)")
+                if hasattr(model, "_pretrained_iter"):
+                    model.resume_iter = model._pretrained_iter
+            elif self.config.model.fsdp_meta_init and not is_rank0():
+                logger.info("Skipping pretrained ckpt load (fsdp_meta_init: non-rank-0 has meta tensors)")
+            else:
+                self.load_pretrained_ckpt(model)
 
         if self.config.trainer.fsdp and (
             self.config.model.precision_amp is not None
@@ -92,32 +99,40 @@ class Trainer:
                 f"While this is possible, it is not recommended."
             )
 
-        logger.info("Starting model.on_train_begin ...")
-        synchronize()
-        model.on_train_begin(is_fsdp=self.config.trainer.fsdp)
-        synchronize()
-        logger.info("model.on_train_begin completed")
+        # Check if model already did sequential FSDP wrapping during build_model
+        fsdp_already_wrapped = getattr(model, "_fsdp_already_wrapped", False)
 
-        # wrap model into DDP or FSDP
-        assert not (
-            self.config.trainer.ddp and self.config.trainer.fsdp
-        ), "Model cannot be wrapped into both DDP and FSDP"
-        if self.config.trainer.ddp:
-            logger.info("Wrapping model into ddp ..")
-            model_ddp = ddp.model_to_ddp(model)
-            logger.info("DDP wrapping completed")
-        elif self.config.trainer.fsdp:
-            logger.info("Wrapping model into fsdp ..")
-            model_ddp = fsdp.model_to_fsdp(
-                model,
-                min_num_params=self.config.trainer.fsdp_min_num_params,
-                apply_cpu_offload=self.config.trainer.fsdp_cpu_offload,
-                sync_module_states=self.config.model.fsdp_meta_init,
-                sharding_group_size=self.config.trainer.fsdp_sharding_group_size,
-            )
-            logger.info("FSDP wrapping completed")
-        else:
+        if fsdp_already_wrapped:
+            logger.info("Model already FSDP-wrapped during build_model (sequential init). Skipping on_train_begin + FSDP wrap.")
+            model._is_fsdp = True
             model_ddp = model
+        else:
+            logger.info("Starting model.on_train_begin ...")
+            synchronize()
+            model.on_train_begin(is_fsdp=self.config.trainer.fsdp)
+            synchronize()
+            logger.info("model.on_train_begin completed")
+
+            # wrap model into DDP or FSDP
+            assert not (
+                self.config.trainer.ddp and self.config.trainer.fsdp
+            ), "Model cannot be wrapped into both DDP and FSDP"
+            if self.config.trainer.ddp:
+                logger.info("Wrapping model into ddp ..")
+                model_ddp = ddp.model_to_ddp(model)
+                logger.info("DDP wrapping completed")
+            elif self.config.trainer.fsdp:
+                logger.info("Wrapping model into fsdp ..")
+                model_ddp = fsdp.model_to_fsdp(
+                    model,
+                    min_num_params=self.config.trainer.fsdp_min_num_params,
+                    apply_cpu_offload=self.config.trainer.fsdp_cpu_offload,
+                    sync_module_states=self.config.model.fsdp_meta_init,
+                    sharding_group_size=self.config.trainer.fsdp_sharding_group_size,
+                )
+                logger.info("FSDP wrapping completed")
+            else:
+                model_ddp = model
         self.callbacks.on_model_init_end(model_ddp)
         synchronize()
 
@@ -137,6 +152,9 @@ class Trainer:
             logger.info("Loading checkpoints for resuming ..")
 
             # load previous checkpoint
+            # Load to CPU first to avoid OOM (checkpoint can be 40+ GB,
+            # and the model is already on GPU). State dicts are copied
+            # to model parameters in-place by load_state_dict.
             iter_start = self.checkpointer.load(
                 model.model_dict,
                 optimizer_dict=model.optimizer_dict,
@@ -144,7 +162,7 @@ class Trainer:
                 grad_scaler=model.grad_scaler,
                 callbacks=self.callbacks,
                 path=autoresume_ckpt,
-                device=model.device,
+                device="cpu",
             )
         self.callbacks.on_load_checkpoint_end(model, iteration=iter_start)
 
@@ -200,16 +218,16 @@ class Trainer:
                 iteration=iter_cur,
             )
 
-            # validation
-            if iter_cur % self.config.trainer.validation_iter == 0 and dataloader_val is not None:
-                self.validate(model_ddp, model, dataloader_val, iteration=iter_cur)
-
-            # save checkpoint
+            # save checkpoint (before validation so progress is not lost if validation is slow)
             just_saved_checkpoint = False
             latest_checkpoint_path = None
             if iter_cur % self.config.trainer.save_ckpt_iter == 0:
                 latest_checkpoint_path = self.save_checkpoint(model, iter_cur)
                 just_saved_checkpoint = True
+
+            # validation
+            if iter_cur % self.config.trainer.validation_iter == 0 and dataloader_val is not None:
+                self.validate(model_ddp, model, dataloader_val, iteration=iter_cur)
 
             if self.auto_resume_exit(
                 model, iter_cur, skip_if_just_saved=just_saved_checkpoint, recent_checkpoint_path=latest_checkpoint_path
@@ -363,9 +381,14 @@ class Trainer:
 
                     self.callbacks.on_validation_step_begin(model, data, step=step, iteration=iteration, idx=idx)
                     data = self.preprocess_data(model, data)
-                    logger.debug(f"iteration: {iteration} | validation step: {step} | data: {basic_utils.to_str(data)}")
+                    logger.debug(f"[val] step {step}: data preprocessed")
                     with model.autocast():
-                        loss_map, outputs = model_ddp.single_train_step(data, iteration)
+                        # Use validation_step if available (causal AR inference),
+                        # otherwise fall back to single_train_step
+                        if hasattr(model, "validation_step"):
+                            loss_map, outputs = model.validation_step(data, iteration)
+                        else:
+                            loss_map, outputs = model_ddp.single_train_step(data, iteration)
                     self.callbacks.on_validation_step_end(
                         model, data, outputs, loss_map, step=step, iteration=iteration, idx=idx
                     )

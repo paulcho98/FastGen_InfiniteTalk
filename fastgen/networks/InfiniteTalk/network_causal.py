@@ -1093,10 +1093,16 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         # --- Cached audio for AR mode ---
         self._cached_audio: Optional[torch.Tensor] = None
 
-        # --- Load weights ---
+        # --- Load weights + apply LoRA ---
         if not self._is_in_meta_context():
             self._load_weights()
             self.to(torch.bfloat16)
+        else:
+            # Meta-init (non-rank-0): skip weight loading but still apply LoRA
+            # adapters so model structure matches rank 0 for FSDP sync.
+            # The causal student always has LoRA adapters (it's always trainable).
+            apply_lora(self, rank=self.lora_rank, alpha=self.lora_alpha)
+            freeze_base(self)
 
     # ------------------------------------------------------------------
     # Unpatchify
@@ -1373,21 +1379,22 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
     def fully_shard(self, **kwargs):
         """Apply FSDP2 sharding to transformer blocks.
 
-        Note: We shard individual blocks and a wrapper Module rather than
-        ``self`` because the network wrapper class uses ABC inheritance
-        which causes Python's ``__class__`` assignment to fail due to
-        incompatible memory layouts.  FSDP2's ``fully_shard`` works by
-        dynamically modifying ``__class__``, so we apply it only to
-        standard ``torch.nn.Module`` submodules.
+        Can't shard ``self`` (ABC) or ``self.blocks`` (ModuleList has no forward).
+        Shard each block and submodule individually with explicit
+        ``reshard_after_forward=True`` to ensure params are freed after each
+        module's forward pass. Without this, all-gathered params persist and
+        cause ~40 GB memory leak per 14B model.
         """
         from torch.distributed._composable.fsdp import fully_shard
+
+        # Force resharding after each module's forward
+        kwargs["reshard_after_forward"] = True
 
         # Shard each transformer block independently
         for block in self.blocks:
             fully_shard(block, **kwargs)
 
-        # Shard other large submodules (embeddings, head)
-        # Don't shard self (ABC __class__ layout incompatibility)
+        # Shard other submodules (embeddings, head) as leaf FSDP units
         for name, child in self.named_children():
             if name == "blocks":
                 continue  # already sharded above
@@ -1523,7 +1530,7 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
                 **kwargs_block,
             )
 
-            if self.training and use_gradient_checkpointing:
+            if self.training and use_gradient_checkpointing and torch.is_grad_enabled():
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     x,
@@ -1533,7 +1540,7 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
             else:
                 x = block(x, **block_kwargs)
 
-        # Head: t_emb is [B, F, dim], need [B, F, 1, dim]
+        # Head: t_emb is [B, dim], need [B, F, 1, dim]
         head_e = t_emb.unsqueeze(2)  # [B, F, 1, dim]
         x = self.head(x, head_e)
 
@@ -1677,7 +1684,7 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
                 cache_local_end_override=cache_local_end,
             )
 
-            if self.training and use_gradient_checkpointing:
+            if self.training and use_gradient_checkpointing and torch.is_grad_enabled():
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     x,
@@ -1840,6 +1847,21 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
             src_pred_type=self.net_pred_type,
             target_pred_type=fwd_pred_type,
         )
+
+        # Hard-anchor frame 0 to clean reference when processing the first chunk.
+        # Modes (controlled by instance attributes):
+        #   _enable_first_frame_anchor = True (default): anchor is active
+        #   _enable_first_frame_anchor = False: anchor fully disabled
+        #   _anchor_eval_only = True: anchor only in eval mode (not during training)
+        #     This allows the student to learn frame 0 via VSD gradient during SF,
+        #     while still anchoring at inference/validation for quality.
+        anchor_active = getattr(self, "_enable_first_frame_anchor", True)
+        if anchor_active and getattr(self, "_anchor_eval_only", False):
+            anchor_active = not self.training
+        if anchor_active and cur_start_frame == 0 and "first_frame_cond" in condition:
+            first_frame_cond = condition["first_frame_cond"]
+            out = out.clone()
+            out[:, :, 0:1] = first_frame_cond[:, :, 0:1]
 
         # Feature extraction -- return expected structure for DMD2 compatibility
         if return_features_early:

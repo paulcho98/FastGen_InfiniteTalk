@@ -145,15 +145,21 @@ def _load_vae(weights_dir: str, device: str):
 
 
 def _load_clip(weights_dir: str, device: str):
-    """Load CLIP ViT-H/14 visual encoder (uses flash_attn natively)."""
+    """Load CLIP ViT-H/14 visual encoder.
+
+    On CPU, uses float32 (float16 ops unsupported on CPU).
+    On GPU, uses float16 (native precision, uses flash_attn).
+    """
     from wan.modules.clip import CLIPModel
 
     clip_ckpt = os.path.join(
         weights_dir, "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth")
     clip_tok = os.path.join(weights_dir, "xlm-roberta-large")
-    logger.info("Lazy cache: loading CLIP from %s", clip_ckpt)
+    # CPU doesn't support float16 ops — use float32
+    clip_dtype = torch.float32 if device == "cpu" else torch.float16
+    logger.info("Lazy cache: loading CLIP from %s (dtype=%s)", clip_ckpt, clip_dtype)
     clip_model = CLIPModel(
-        dtype=torch.float16,
+        dtype=clip_dtype,
         device=device,
         checkpoint_path=clip_ckpt,
         tokenizer_path=clip_tok,
@@ -308,26 +314,34 @@ def _encode_vae(vae, video_tensor, device, cond_image):
         first_frame_cond: [C_lat, T_lat, H_lat, W_lat]
         motion_frame: [C_lat, 1, H_lat, W_lat]
     """
-    video = video_tensor.to(device)
+    # Cast to match VAE weight dtype (WanVAE exposes .dtype; fallback to model params)
+    vae_dtype = getattr(vae, "dtype", None) or next(vae.model.parameters()).dtype
+    video = video_tensor.to(device=device, dtype=vae_dtype)
 
-    # Full video latents
+    # Full video latents (biggest activation spike — 93 frames)
     latents = vae.encode([video])
     latents = latents[0].cpu()
+    # Free the big input immediately
+    del video
+    if device != "cpu":
+        torch.cuda.empty_cache()
 
     # First-frame condition: first frame + zero padding
-    c, t, h, w = video.shape
-    cond_image_dev = cond_image.to(device)  # [1, C, 1, H, W]
+    c, t, h, w = video_tensor.shape
+    cond_image_dev = cond_image.to(device=device, dtype=vae_dtype)  # [1, C, 1, H, W]
     zero_padding = torch.zeros(
-        1, cond_image_dev.shape[1], t - 1, h, w, device=device
+        1, cond_image_dev.shape[1], t - 1, h, w, device=device, dtype=vae_dtype
     )
     first_frame_padded = torch.cat([cond_image_dev, zero_padding], dim=2)  # [1, C, t, H, W]
+    del zero_padding
     first_frame_cond = vae.encode(first_frame_padded)
     first_frame_cond = torch.stack(first_frame_cond).to(torch.bfloat16)[0].cpu()
+    del first_frame_padded
 
     # Motion frame: single reference frame (no temporal context)
     motion_frame = vae.encode(cond_image_dev)
     motion_frame = torch.stack(motion_frame).to(torch.bfloat16)[0].cpu()
-    # motion_frame: [16, 1, H_lat, W_lat]
+    del cond_image_dev
 
     return latents, first_frame_cond, motion_frame
 
@@ -343,7 +357,8 @@ def _encode_clip(clip_model, device, cond_image):
     Returns:
         clip_features: [1, 257, 1280] bf16
     """
-    first_frame = cond_image[:, :, -1:, :, :].to(device)  # [1, C, 1, H, W]
+    clip_dtype = getattr(clip_model, "dtype", None) or next(clip_model.model.parameters()).dtype
+    first_frame = cond_image[:, :, -1:, :, :].to(device=device, dtype=clip_dtype)  # [1, C, 1, H, W]
     clip_features = clip_model.visual(first_frame)  # [1, 257, 1280]
     clip_features = clip_features.to(torch.bfloat16)
     return clip_features.cpu()
@@ -401,6 +416,33 @@ def _save_atomic(tensor, path):
     os.rename(tmp_path, path)  # atomic on same filesystem
 
 
+def _move_encoder_to(encoder, device):
+    """Move a WanVAE / CLIPModel / nn.Module to device.
+
+    WanVAE and CLIPModel aren't nn.Module — they wrap .model (nn.Module)
+    and track .device as a string attribute. WanVAE also has .mean, .std,
+    .scale tensors used in encode/decode that must be moved too.
+    """
+    if hasattr(encoder, "model") and hasattr(encoder.model, "to"):
+        encoder.model.to(device)
+    elif hasattr(encoder, "to"):
+        encoder.to(device)
+    # Move any tensor attributes (WanVAE: .mean, .std, .scale)
+    for attr in ("mean", "std"):
+        if hasattr(encoder, attr):
+            val = getattr(encoder, attr)
+            if isinstance(val, torch.Tensor):
+                setattr(encoder, attr, val.to(device))
+    if hasattr(encoder, "scale") and isinstance(getattr(encoder, "scale"), list):
+        encoder.scale = [s.to(device) if isinstance(s, torch.Tensor) else s
+                         for s in encoder.scale]
+    # Update .device attr if it's a plain attribute (not a property)
+    if hasattr(encoder, "device") and not isinstance(
+        getattr(type(encoder), "device", None), property
+    ):
+        encoder.device = str(device)
+
+
 class InfiniteTalkDataset(Dataset):
     """
     Dataset for InfiniteTalk training data with precomputed tensors.
@@ -432,6 +474,7 @@ class InfiniteTalkDataset(Dataset):
         num_video_frames: int = 93,
         num_latent_frames: int = 21,
         expected_latent_shape: tuple = None,
+        quarter_res: bool = False,
         audio_data_root: str = None,
         # --- Lazy caching params ---
         raw_data_root: str = None,
@@ -475,6 +518,8 @@ class InfiniteTalkDataset(Dataset):
         self.num_latent_frames = num_latent_frames
         self._train_pixel_frames = (num_latent_frames - 1) * 4 + 1  # e.g. 81 for 21 latent frames
         self.expected_latent_shape = tuple(expected_latent_shape) if expected_latent_shape else None
+        self.quarter_res = quarter_res
+        self._vae_suffix = "_quarter" if quarter_res else ""
         self.audio_data_root = audio_data_root
         self._lazy_enabled = False
 
@@ -491,12 +536,15 @@ class InfiniteTalkDataset(Dataset):
             # Set up InfiniteTalk module path and mock modules
             _add_infinitetalk_to_path()
 
-            # Load encoders (once, kept for the lifetime of the dataset)
-            logger.info("Lazy caching enabled — loading encoders to %s", encode_device)
-            self._vae = _load_vae(weights_dir, encode_device)
-            self._clip = _load_clip(weights_dir, encode_device)
-            self._wav2vec_fe, self._audio_encoder = _load_wav2vec(wav2vec_dir, encode_device)
-            logger.info("All lazy-cache encoders loaded")
+            # Load encoders on CPU — they'll be moved to GPU on-demand during
+            # encoding, then moved back. This avoids OOM since the training model
+            # uses ~77GB of 80GB, but the VAE only needs ~7.3GB peak temporarily
+            # (freed after each encode via empty_cache).
+            logger.info("Lazy caching enabled — loading encoders to CPU (will offload to %s for encoding)", encode_device)
+            self._vae = _load_vae(weights_dir, "cpu")
+            self._clip = _load_clip(weights_dir, "cpu")
+            self._wav2vec_fe, self._audio_encoder = _load_wav2vec(wav2vec_dir, "cpu")
+            logger.info("All lazy-cache encoders loaded on CPU")
 
             # Build mapping: sample directory basename -> CSV row
             # The precompute script names sample dirs as:
@@ -562,7 +610,7 @@ class InfiniteTalkDataset(Dataset):
         if self.expected_latent_shape is not None:
             self.dirs = []
             for d in valid_dirs:
-                vae_path = os.path.join(d, "vae_latents.pt")
+                vae_path = os.path.join(d, f"vae_latents{self._vae_suffix}.pt")
                 if not os.path.exists(vae_path):
                     # Lazy mode: can't check shape before encoding — include it
                     # and let __getitem__ handle shape mismatch after encoding
@@ -639,15 +687,23 @@ class InfiniteTalkDataset(Dataset):
         )[0]
         target_h, target_w = ASPECT_RATIO_627[closest_bucket]
 
+        if self.quarter_res:
+            target_h = target_h // 2
+            target_w = target_w // 2
+
         # Per-file skip: only compute what's missing
         def _exists(name):
             return os.path.isfile(os.path.join(sample_dir, name))
 
-        need_vae = not _exists("vae_latents.pt")
-        need_ffc = not _exists("first_frame_cond.pt")
-        need_motion = not _exists("motion_frame.pt")
+        need_vae = not _exists(f"vae_latents{self._vae_suffix}.pt")
+        need_ffc = not _exists(f"first_frame_cond{self._vae_suffix}.pt")
+        need_motion = not _exists(f"motion_frame{self._vae_suffix}.pt")
         need_clip = not _exists("clip_features.pt")
         need_audio = not _exists("audio_emb.pt")
+
+        # In quarter_res mode, CLIP and audio are resolution-independent —
+        # only skip re-encoding if they already exist on disk.
+        # (Don't unconditionally skip: samples that were never precomputed still need them.)
 
         need_video = need_vae or need_ffc or need_motion or need_clip
         video_tensor = None
@@ -675,40 +731,57 @@ class InfiniteTalkDataset(Dataset):
             cond_image = _resize_and_centercrop_pil(first_frame_pil, target_h, target_w)
             # cond_image: [1, C, 1, H, W] float32 in [-1, 1]
 
-        # ---- VAE encode ----
+        # ---- Encode with GPU offloading ----
+        # Encoders live on CPU. For each encode step:
+        #   1. empty_cache() to free training activation memory
+        #   2. Move encoder to GPU
+        #   3. Encode (outputs moved to CPU immediately)
+        #   4. Move encoder back to CPU
+        #   5. empty_cache() to reclaim GPU memory for training
+        # This allows encoding even when training uses ~77GB of 80GB,
+        # since we only need temporary GPU headroom for one encoder at a time.
+        device = self._device
+
         if need_vae or need_ffc or need_motion:
             logger.info("Lazy cache: encoding VAE for %s", os.path.basename(sample_dir))
-            latents, first_frame_cond, motion_frame = _encode_vae(
-                self._vae, video_tensor, self._device, cond_image
-            )
-            if need_vae:
-                _save_atomic(latents, os.path.join(sample_dir, "vae_latents.pt"))
-            if need_ffc:
-                _save_atomic(first_frame_cond, os.path.join(sample_dir, "first_frame_cond.pt"))
-            if need_motion:
-                _save_atomic(motion_frame, os.path.join(sample_dir, "motion_frame.pt"))
-            del latents, first_frame_cond, motion_frame
             torch.cuda.empty_cache()
+            _move_encoder_to(self._vae, device)
+            latents, first_frame_cond, motion_frame = _encode_vae(
+                self._vae, video_tensor, device, cond_image
+            )
+            _move_encoder_to(self._vae, "cpu")
+            torch.cuda.empty_cache()
+            if need_vae:
+                _save_atomic(latents, os.path.join(sample_dir, f"vae_latents{self._vae_suffix}.pt"))
+            if need_ffc:
+                _save_atomic(first_frame_cond, os.path.join(sample_dir, f"first_frame_cond{self._vae_suffix}.pt"))
+            if need_motion:
+                _save_atomic(motion_frame, os.path.join(sample_dir, f"motion_frame{self._vae_suffix}.pt"))
+            del latents, first_frame_cond, motion_frame
 
-        # ---- CLIP encode ----
         if need_clip:
             logger.info("Lazy cache: encoding CLIP for %s", os.path.basename(sample_dir))
-            clip_features = _encode_clip(self._clip, self._device, cond_image)
+            torch.cuda.empty_cache()
+            _move_encoder_to(self._clip, device)
+            clip_features = _encode_clip(self._clip, device, cond_image)
+            _move_encoder_to(self._clip, "cpu")
+            torch.cuda.empty_cache()
             _save_atomic(clip_features, os.path.join(sample_dir, "clip_features.pt"))
             del clip_features
-            torch.cuda.empty_cache()
 
-        # ---- Audio encode ----
         if need_audio:
             logger.info("Lazy cache: encoding audio for %s", os.path.basename(sample_dir))
+            torch.cuda.empty_cache()
+            _move_encoder_to(self._audio_encoder, device)
             audio_array = _load_audio_array(audio_path)
             audio_emb = _encode_audio(
                 self._wav2vec_fe, self._audio_encoder, audio_array,
-                num_video_frames=self.num_video_frames, device=self._device,
+                num_video_frames=self.num_video_frames, device=device,
             )
+            _move_encoder_to(self._audio_encoder, "cpu")
+            torch.cuda.empty_cache()
             _save_atomic(audio_emb, os.path.join(sample_dir, "audio_emb.pt"))
             del audio_emb, audio_array
-            torch.cuda.empty_cache()
 
         # Clean up video data
         del video_tensor, cond_image
@@ -716,11 +789,27 @@ class InfiniteTalkDataset(Dataset):
     def __len__(self):
         return len(self.dirs)
 
+    def _check_sample_shape(self, sample: dict, sample_dir: str):
+        """Validate spatial dims match expected_latent_shape. Returns sample or None."""
+        if self.expected_latent_shape is None or sample is None:
+            return sample
+        expected_spatial = (self.expected_latent_shape[0],) + tuple(self.expected_latent_shape[2:])
+        real = sample["real"]
+        actual_spatial = (real.shape[0],) + tuple(real.shape[2:])
+        if actual_spatial != expected_spatial:
+            warnings.warn(
+                f"Shape mismatch after load: {os.path.basename(sample_dir)} "
+                f"has {list(real.shape)}, expected spatial {list(expected_spatial)}"
+            )
+            return None
+        return sample
+
     def __getitem__(self, idx) -> dict:
         sample_dir = self.dirs[idx]
 
         try:
-            return self._load_sample(sample_dir)
+            sample = self._load_sample(sample_dir)
+            return self._check_sample_shape(sample, sample_dir)
         except Exception:
             pass
 
@@ -745,7 +834,8 @@ class InfiniteTalkDataset(Dataset):
 
             try:
                 self._encode_and_cache(sample_dir, csv_row)
-                return self._load_sample(sample_dir)
+                sample = self._load_sample(sample_dir)
+                return self._check_sample_shape(sample, sample_dir)
             except Exception as e:
                 warnings.warn(f"Lazy encoding failed for {sample_dir}: {e}")
                 return None
@@ -759,7 +849,7 @@ class InfiniteTalkDataset(Dataset):
         """
         # --- VAE latents (clean video) ---
         real = torch.load(
-            os.path.join(sample_dir, "vae_latents.pt"),
+            os.path.join(sample_dir, f"vae_latents{self._vae_suffix}.pt"),
             map_location="cpu",
             weights_only=False,
         )
@@ -771,7 +861,7 @@ class InfiniteTalkDataset(Dataset):
 
         # --- First frame conditioning ---
         first_frame_cond = torch.load(
-            os.path.join(sample_dir, "first_frame_cond.pt"),
+            os.path.join(sample_dir, f"first_frame_cond{self._vae_suffix}.pt"),
             map_location="cpu",
             weights_only=False,
         )
@@ -849,6 +939,9 @@ class InfiniteTalkDataset(Dataset):
         }
 
         # --- Source audio path (optional, for wandb video muxing) ---
+        # Always include the key (empty string if not found) so that
+        # default_collate doesn't crash on inconsistent keys at BS>1.
+        audio_wav_path = ""
         if self.audio_data_root:
             basename = os.path.basename(sample_dir)
             if basename.startswith("data_"):
@@ -860,7 +953,8 @@ class InfiniteTalkDataset(Dataset):
                 clip_name = f"{video_id}_{'_'.join(parts[2:])}"
                 wav_path = os.path.join(self.audio_data_root, video_id, f"{clip_name}.wav")
                 if os.path.exists(wav_path):
-                    result["audio_path"] = wav_path
+                    audio_wav_path = wav_path
+        result["audio_path"] = audio_wav_path
 
         # --- ODE trajectory (optional, for KD training) ---
         if self.load_ode_path:
@@ -894,6 +988,7 @@ class InfiniteTalkDataLoader:
         batch_size: int = 1,
         num_workers: int = 4,
         load_ode_path: bool = False,
+        quarter_res: bool = False,
         **kwargs,
     ):
         # Support both data_list_path and datatags (list of paths)
@@ -913,6 +1008,7 @@ class InfiniteTalkDataLoader:
         self.dataset = InfiniteTalkDataset(
             data_list_path=data_list_path,
             load_ode_path=load_ode_path,
+            quarter_res=quarter_res,
             **kwargs,
         )
         self.batch_size = batch_size
@@ -945,12 +1041,16 @@ class InfiniteTalkDataLoader:
         )
 
     def __iter__(self):
-        """Infinite iterator -- cycles through the dataset."""
+        """Infinite iterator -- cycles through the dataset, skipping empty batches."""
         epoch = 0
         while True:
             if self._sampler is not None:
                 self._sampler.set_epoch(epoch)
-            yield from self._dataloader
+            for batch in self._dataloader:
+                if batch and "real" in batch:
+                    yield batch
+                else:
+                    logger.warning("Skipping empty batch (all samples in batch failed to load)")
             epoch += 1
 
     def __len__(self):

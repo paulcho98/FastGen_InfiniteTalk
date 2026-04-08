@@ -95,9 +95,9 @@ def setup(args: argparse.Namespace, evaluation: bool = False) -> BaseConfig:
             logger.warning("Ignoring fsdp_meta_init for evaluation/inference.")
             config.model.fsdp_meta_init = False
         elif config.trainer.checkpointer.pretrained_ckpt_path:
-            # TODO: this functionality is not implemented yet
-            logger.warning("Ignoring fsdp_meta_init for loading pretrained checkpoint.")
-            config.model.fsdp_meta_init = False
+            # Pretrained checkpoint loading with meta init: only rank 0 loads weights
+            # (non-rank-0 has meta tensors). FSDP sync_module_states broadcasts from rank 0.
+            logger.info("fsdp_meta_init with pretrained checkpoint: rank 0 will load, FSDP will broadcast.")
 
     # Global batch size
     if getattr(config.trainer, "batch_size_global", None) is not None:

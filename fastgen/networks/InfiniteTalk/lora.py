@@ -208,6 +208,18 @@ def apply_lora(
 
 
 # ---------------------------------------------------------------------------
+# has_lora — check if model contains LoRA layers
+# ---------------------------------------------------------------------------
+
+def has_lora(model: nn.Module) -> bool:
+    """Check if *model* has any ``LoRALinear`` layers."""
+    for module in model.modules():
+        if isinstance(module, LoRALinear):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # freeze_base — freeze everything except LoRA + audio
 # ---------------------------------------------------------------------------
 

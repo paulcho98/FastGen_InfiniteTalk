@@ -31,6 +31,7 @@ from fastgen.configs.callbacks import (
     GPUStats_CALLBACK,
     EMA_CALLBACK,
 )
+from fastgen.callbacks.infinitetalk_sf_wandb import InfiniteTalkSFWandbCallback
 
 
 @attrs.define(slots=False)
@@ -41,6 +42,26 @@ class InfiniteTalkSFModelConfig(SFModelConfig):
 
     # Separate fake_score config (allows LoRA-based 14B fake_score distinct from teacher)
     fake_score_net: Optional[DictConfig] = None
+
+    # Sequential FSDP init: build each model → FSDP-shard → free CPU → build next.
+    # Required for 3x 14B models that exceed CPU RAM if built simultaneously.
+    fsdp_sequential_init: bool = False
+
+    # Student first-frame anchor mode:
+    #   False (default): student anchors frame 0 always (I2V style)
+    #   True: student anchors only in eval mode (inference/validation).
+    #         During training rollout, no anchor → student learns frame 0 via VSD gradient.
+    student_anchor_eval_only: bool = False
+
+    # Fake score first-frame anchor mode:
+    #   False (default): fake_score always anchors frame 0
+    #   True: fake_score anchors only in eval mode — matches student's soft conditioning
+    #         so it tracks the student's actual distribution (no clean frame 0 during training).
+    #         Teacher always anchors regardless (represents target distribution).
+    fake_score_anchor_eval_only: bool = False
+
+    # Gradient accumulation rounds (mirrored from trainer config for combined step scaling)
+    grad_accum_rounds: int = 1
 
 
 @attrs.define(slots=False)
@@ -60,7 +81,11 @@ def create_config():
             **TrainProfiler_CALLBACK,
             **ParamCount_CALLBACK,
             **EMA_CALLBACK,
-            **WANDB_CALLBACK,
+            # Note: standard WANDB_CALLBACK replaced by InfiniteTalk-specific callback
+            # that handles SF loss keys (vsd_loss, fake_score_loss) and AR video logging.
+            "infinitetalk_sf_wandb": L(InfiniteTalkSFWandbCallback)(
+                sample_logging_iter=100,
+            ),
         }
     )
 

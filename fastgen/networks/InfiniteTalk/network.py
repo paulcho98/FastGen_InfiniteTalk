@@ -202,6 +202,35 @@ class InfiniteTalkWan(FastGenNetwork):
         if not self._is_in_meta_context():
             self._load_weights()
             self.model.to(torch.bfloat16)
+        else:
+            # Meta-init (non-rank-0): skip weight loading but still apply LoRA
+            # adapters so model structure matches rank 0 for FSDP sync.
+            if self.apply_lora_adapters:
+                apply_lora(self.model, rank=self.lora_rank, alpha=self.lora_alpha)
+                freeze_base(self.model)
+
+    # ------------------------------------------------------------------
+    # FSDP2 sharding
+    # ------------------------------------------------------------------
+
+    def fully_shard(self, **kwargs):
+        """Apply FSDP2 sharding to the internal WanModel.
+
+        Shards each transformer block individually, then wraps self.model as
+        the FSDP root. The root wrapper is critical: without it, child FSDP
+        units all-gather params during forward but never reshard (no parent
+        post-forward hook to trigger it), causing ~40 GB memory leak per model.
+        """
+        from torch.distributed._composable.fsdp import fully_shard
+
+        # Shard each transformer block independently
+        for block in self.model.blocks:
+            fully_shard(block, **kwargs)
+
+        # Shard root (self.model) — this triggers resharding of all children
+        # after forward completes. self.model is a plain nn.Module (WanModel),
+        # so __class__ assignment works fine.
+        fully_shard(self.model, **kwargs)
 
     # ------------------------------------------------------------------
     # Weight loading
@@ -587,6 +616,19 @@ class InfiniteTalkWan(FastGenNetwork):
             src_pred_type=self.net_pred_type,
             target_pred_type=fwd_pred_type,
         )
+
+        # Hard-anchor frame 0 to clean reference.
+        # By default, always anchors (teacher behavior).
+        # When _anchor_eval_only=True, only anchors in eval mode — used for
+        # fake_score in soft-anchor training so it tracks the student distribution
+        # (which also doesn't anchor during training).
+        anchor_active = getattr(self, "_enable_first_frame_anchor", True)
+        if anchor_active and getattr(self, "_anchor_eval_only", False):
+            anchor_active = not self.training
+        if anchor_active and isinstance(condition, dict) and "first_frame_cond" in condition:
+            first_frame_cond = condition["first_frame_cond"]
+            out = out.clone()
+            out[:, :, 0:1] = first_frame_cond[:, :, 0:1]
 
         # --- Return format depends on what was requested ---
         if features is not None:

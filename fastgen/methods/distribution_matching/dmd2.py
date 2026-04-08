@@ -153,12 +153,13 @@ class DMD2Model(FastGenModel):
             # Compute the GAN loss for the generator
             gan_loss_gen = gan_loss_generator(self.discriminator(fake_feat))
         else:
-            teacher_x0 = self.teacher(
-                perturbed_data,
-                t,
-                condition=condition,
-                fwd_pred_type="x0",
-            )
+            with torch.no_grad():
+                teacher_x0 = self.teacher(
+                    perturbed_data,
+                    t,
+                    condition=condition,
+                    fwd_pred_type="x0",
+                )
             gan_loss_gen = torch.tensor(0.0, device=self.device, dtype=teacher_x0.dtype)
 
         return teacher_x0.detach(), gan_loss_gen

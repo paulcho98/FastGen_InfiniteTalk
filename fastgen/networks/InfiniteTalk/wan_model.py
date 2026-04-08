@@ -754,8 +754,8 @@ class WanModel(nn.Module):
         )
 
         def create_custom_forward(module):
-            def custom_forward(*inputs):
-                return module(*inputs)
+            def custom_forward(*inputs, **kwargs):
+                return module(*inputs, **kwargs)
             return custom_forward
 
         features = []
