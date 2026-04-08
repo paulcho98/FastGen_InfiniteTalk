@@ -843,15 +843,36 @@ def main():
         logger.info("InfiniteTalk ODE Trajectory Generation")
         logger.info("=" * 70)
 
+    # Serialize model loading across ranks to avoid CPU OOM.
+    # The 14B model peaks at ~56 GB CPU RAM during float32 construction;
+    # loading all ranks simultaneously can exceed system memory.
+    # Use a gloo barrier (CPU-based) because the NCCL communicator isn't
+    # initialized until the first NCCL collective, and the default NCCL
+    # timeout (600s) can expire while waiting for the other rank to load.
     t_model_start = time.time()
-    teacher = build_teacher(
-        weights_dir=args.weights_dir,
-        infinitetalk_ckpt=args.infinitetalk_ckpt,
-        lora_ckpt=args.lora_ckpt,
-        shift=args.shift,
-        device=device,
-        dtype=dtype,
-    )
+    if world_size > 1:
+        gloo_group = dist.new_group(backend="gloo")
+        for loading_rank in range(world_size):
+            if global_rank == loading_rank:
+                logger.info(f"Rank {global_rank}: loading teacher model...")
+                teacher = build_teacher(
+                    weights_dir=args.weights_dir,
+                    infinitetalk_ckpt=args.infinitetalk_ckpt,
+                    lora_ckpt=args.lora_ckpt,
+                    shift=args.shift,
+                    device=device,
+                    dtype=dtype,
+                )
+            dist.barrier(group=gloo_group)
+    else:
+        teacher = build_teacher(
+            weights_dir=args.weights_dir,
+            infinitetalk_ckpt=args.infinitetalk_ckpt,
+            lora_ckpt=args.lora_ckpt,
+            shift=args.shift,
+            device=device,
+            dtype=dtype,
+        )
     noise_scheduler = teacher.noise_scheduler
 
     if global_rank == 0:

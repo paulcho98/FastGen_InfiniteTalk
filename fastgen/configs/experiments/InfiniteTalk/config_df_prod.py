@@ -86,7 +86,7 @@ def create_config():
         csv_path=CSV_PATH,
         weights_dir=WEIGHTS_DIR,
         wav2vec_dir=WAV2VEC_DIR,
-        encode_device="cpu",  # CPU encoding avoids OOM (training uses ~77 GB of 80 GB)
+        encode_device="cuda",  # GPU offload: encoders on CPU, moved to GPU per-encode (~7GB peak fits in ~35GB headroom)
         num_workers=0,  # required for lazy caching (encoders can't cross process boundaries)
     )
 
@@ -130,7 +130,9 @@ def create_config():
     grad_accum = config.trainer.grad_accum_rounds
     config.log_config.project = "DF_InfiniteTalk"
     config.log_config.group = "infinitetalk_df"
-    config.log_config.name = f"r{lora_rank}_a{config.model.net.lora_alpha}_accum{grad_accum}_lr1e-5"
+    import time
+    timestamp = time.strftime("%m%d_%H%M")
+    config.log_config.name = f"r{lora_rank}_a{config.model.net.lora_alpha}_accum{grad_accum}_lr1e-5_{timestamp}"
     config.log_config.wandb_mode = "online"
 
     return config
