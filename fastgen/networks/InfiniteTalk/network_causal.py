@@ -471,7 +471,10 @@ class CausalSelfAttention(nn.Module):
             # to ensure gradient-checkpointing recomputation sees the same state.
             if cache_local_end_override is not None:
                 local_end = cache_local_end_override
-                global_end = cache_local_end_override
+                # global_end tracks the actual sequence position (not cache buffer position).
+                # After sliding-window eviction, global_end > local_end.
+                # current_start IS the global position of already-cached content.
+                global_end = current_start
             else:
                 global_end = kv_cache["global_end_index"].item()
                 local_end = kv_cache["local_end_index"].item()
@@ -1347,18 +1350,29 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
     ) -> None:
         """Allocate KV caches for all transformer blocks.
 
-        For InfiniteTalk with 21 latent frames, the cache is sized for
-        the full sequence (no eviction needed).
+        During training, always allocates the full sequence size to avoid
+        in-place eviction — gradient checkpointing recomputes forward passes
+        that read from cache, so the buffer must remain stable between forward
+        and backward (see docs/kv-cache-eviction-gradient-checkpointing.md).
+
+        During inference (model.eval()), uses the smaller
+        ``local_attn_size * frame_seqlen`` cache with rolling eviction to
+        save memory on long sequences.
         """
         n = self._num_heads
         d = self._dim // n
+
+        if not self.training and self.local_attn_size > 0:
+            cache_tokens = self.local_attn_size * frame_seqlen
+        else:
+            cache_tokens = total_tokens
 
         self._kv_caches = []
         for _ in self.blocks:
             self._kv_caches.append(
                 {
-                    "k": torch.zeros(batch_size, total_tokens, n, d, device=device, dtype=dtype),
-                    "v": torch.zeros(batch_size, total_tokens, n, d, device=device, dtype=dtype),
+                    "k": torch.zeros(batch_size, cache_tokens, n, d, device=device, dtype=dtype),
+                    "v": torch.zeros(batch_size, cache_tokens, n, d, device=device, dtype=dtype),
                     "global_end_index": torch.tensor(0, device=device, dtype=torch.long),
                     "local_end_index": torch.tensor(0, device=device, dtype=torch.long),
                 }
