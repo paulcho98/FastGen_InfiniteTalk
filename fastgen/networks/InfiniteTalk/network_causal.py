@@ -239,6 +239,92 @@ def rope_apply_full(
     return causal_rope_apply(x, grid_sizes, freqs, start_frame=0)
 
 
+def _apply_window_rope(
+    q: torch.Tensor,
+    k_win: torch.Tensor,
+    grid_sizes: torch.Tensor,
+    freqs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    frame_seqlen: int,
+    sink_tokens: int,
+    query_offset_in_win: int,
+    *,
+    lookahead_sink_enabled: bool,
+    lookahead_distance: int,
+    use_dynamic_rope: bool,
+    static_roped_q: Optional[torch.Tensor] = None,
+    static_k_win: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE for the AR attention window.
+
+    Dynamic-RoPE mode rotates Q and the (un-rotated) k_win at read time. When
+    lookahead is active (lookahead_sink_enabled=True AND sink_tokens > 0 AND
+    k_win contains a distinct sink slab at its front):
+      - Sink K rotated at position F_window - 1 + lookahead_distance
+      - Rest K (rolling + current) rotated at positions
+        [sink_frames_n, ..., F_window - 1] (sink's old slot 0 is left empty)
+      - Q rotated at its natural position query_offset_in_win // frame_seqlen
+
+    Only the sink's absolute position changes when the flag flips — rolling
+    and Q positions are identical to the no-lookahead case.
+
+    Static-RoPE mode returns the pre-rotated tensors unchanged.
+
+    When env var LOOKAHEAD_DEBUG_TRACE=1 and lookahead fires, logs a single
+    [lookahead] line with the computed positions (kept as permanent debug aid).
+
+    Returns:
+        (roped_q, roped_k) ready for flash_attn.
+    """
+    if not use_dynamic_rope:
+        return static_roped_q, static_k_win
+
+    F_window = k_win.shape[1] // frame_seqlen
+    use_lookahead = (
+        lookahead_sink_enabled
+        and sink_tokens > 0
+        and sink_tokens < k_win.shape[1]
+    )
+
+    if use_lookahead:
+        sink_frames_n = sink_tokens // frame_seqlen
+        rest_frames_n = F_window - sink_frames_n
+        sink_pos = F_window - 1 + lookahead_distance
+
+        if os.environ.get("LOOKAHEAD_DEBUG_TRACE") == "1":
+            logger.info(
+                f"[lookahead] use_lookahead=True F_window={F_window} "
+                f"sink_tokens={sink_tokens} sink_frames_n={sink_frames_n} "
+                f"rest_frames_n={rest_frames_n} sink_pos={sink_pos} "
+                f"rest_start=1 q_start={query_offset_in_win // frame_seqlen}"
+            )
+
+        sink_grid = grid_sizes.clone()
+        sink_grid[:, 0] = sink_frames_n
+        k_sink_roped = causal_rope_apply(
+            k_win[:, :sink_tokens], sink_grid, freqs, start_frame=sink_pos,
+        ).type_as(q)
+
+        rest_grid = grid_sizes.clone()
+        rest_grid[:, 0] = rest_frames_n
+        k_rest_roped = causal_rope_apply(
+            k_win[:, sink_tokens:], rest_grid, freqs, start_frame=sink_frames_n,
+        ).type_as(q)
+
+        roped_key = torch.cat([k_sink_roped, k_rest_roped], dim=1)
+    else:
+        k_grid = grid_sizes.clone()
+        k_grid[:, 0] = F_window
+        roped_key = causal_rope_apply(
+            k_win, k_grid, freqs, start_frame=0,
+        ).type_as(q)
+
+    q_frame_start = query_offset_in_win // frame_seqlen
+    roped_query = causal_rope_apply(
+        q, grid_sizes, freqs, start_frame=q_frame_start,
+    ).type_as(q)
+    return roped_query, roped_key
+
+
 # ---------------------------------------------------------------------------
 # Embedding helpers
 # ---------------------------------------------------------------------------
@@ -558,25 +644,21 @@ class CausalSelfAttention(nn.Module):
                     v_win = torch.cat([v_past, v], dim=1)
                 query_offset_in_win = new_local_start - k_win_start
 
-            # -- 6. Apply RoPE (mode-dependent) --
-            if not self.use_dynamic_rope:
-                # Original mode: Q already rotated, k_win contains rotated keys
-                roped_query = roped_q
-                roped_key = k_win
-            else:
-                # Dynamic mode: apply window-local RoPE to the full window
-                F_window = k_win.shape[1] // frame_seqlen
-                k_grid = grid_sizes.clone()
-                k_grid[:, 0] = F_window
-                roped_key = causal_rope_apply(
-                    k_win, k_grid, freqs, start_frame=0
-                ).type_as(v)
-
-                # Q position within the window
-                q_frame_start = query_offset_in_win // frame_seqlen
-                roped_query = causal_rope_apply(
-                    q, grid_sizes, freqs, start_frame=q_frame_start
-                ).type_as(v)
+            # -- 6. Apply RoPE (mode-dependent, sink-aware) --
+            roped_query, roped_key = _apply_window_rope(
+                q=q,
+                k_win=k_win,
+                grid_sizes=grid_sizes,
+                freqs=freqs,
+                frame_seqlen=frame_seqlen,
+                sink_tokens=sink_tokens,
+                query_offset_in_win=query_offset_in_win,
+                lookahead_sink_enabled=self.lookahead_sink_enabled,
+                lookahead_distance=self.lookahead_distance,
+                use_dynamic_rope=self.use_dynamic_rope,
+                static_roped_q=(roped_q if not self.use_dynamic_rope else None),
+                static_k_win=(k_win if not self.use_dynamic_rope else None),
+            )
 
             # -- 7. Attention --
             x = _flash_attention(roped_query, roped_key, v_win)
