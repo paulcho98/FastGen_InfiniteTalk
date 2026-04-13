@@ -185,75 +185,20 @@ class InfiniteTalkSFWandbCallback(Callback):
         return float(val)
 
     # ------------------------------------------------------------------
-    # GT upload at training start
+    # GT upload at training start — REMOVED 2026-04-13
+    #
+    # Earlier versions of this callback (ported from InfiniteTalkWandbCallback)
+    # overrode on_dataloader_init_end to decode val dataloader samples via VAE
+    # on rank 0 and log them to wandb as val_gt/videos at step 0. Under SF FSDP
+    # training with wandb's synchronous upload path, rank 0's upload could stall
+    # indefinitely (>30 min observed), triggering NCCL_TIMEOUT while ranks 1-7
+    # waited at the trailing synchronize().
+    #
+    # The functionality is PRESERVED via the fallback in on_validation_end: on
+    # the first validation pass, stored real latents are decoded and logged as
+    # val{idx}/reconstructed. So GT still appears in wandb — just at iter
+    # {validation_iter} instead of iter 0.
     # ------------------------------------------------------------------
-
-    def on_dataloader_init_end(
-        self, model, dataloader_train, dataloader_val, iteration: int = 0,
-    ) -> None:
-        """Upload ground-truth validation videos at training start (rank 0 only).
-
-        Lazy-loads the VAE via the model's ``_ensure_vae_loaded`` helper so we
-        can decode the precomputed ``real`` latents. If the VAE can't load,
-        defers GT upload to the first validation pass.
-        """
-        if dataloader_val is None:
-            synchronize()
-            return
-
-        # Lazy-load VAE now so we can decode GT. All ranks attempt (each rank has its own VAE)
-        # so that validation_step on non-rank-0 ranks doesn't trigger a second load.
-        if hasattr(model, "_ensure_vae_loaded"):
-            try:
-                model._ensure_vae_loaded()
-            except Exception as e:
-                logger.warning(f"_ensure_vae_loaded during init failed: {e}")
-
-        if not hasattr(model.net, "vae"):
-            if is_rank0():
-                logger.info("No VAE loaded — deferring GT val video upload to first validation")
-            synchronize()
-            return
-
-        if is_rank0():
-            logger.info("Uploading GT validation videos to wandb...")
-            device = model.device
-            try:
-                gt_videos_uint8: list[torch.Tensor] = []
-                audio_paths: list[Optional[str]] = []
-                with torch.no_grad():
-                    for step, data in enumerate(dataloader_val):
-                        real = data["real"].to(device)
-                        decoded = model.net.vae.decode(real[:1].float())
-                        gt_videos_uint8.append(self._to_uint8_video(decoded))
-                        ap = data.get("audio_path")
-                        if ap is not None and isinstance(ap, (list, tuple)):
-                            ap = ap[0]
-                        audio_paths.append(ap)
-
-                if wandb.run:
-                    gt_list: list[wandb.Video] = []
-                    tmp_files: list[str] = []
-                    for vi, v in enumerate(gt_videos_uint8):
-                        vid_obj, tmp = self._build_wandb_video(v, audio_paths[vi])
-                        if vid_obj is not None:
-                            gt_list.append(vid_obj)
-                        if tmp:
-                            tmp_files.append(tmp)
-                    if gt_list:
-                        wandb.log({"val_gt/videos": gt_list}, step=0)
-                    for tf in tmp_files:
-                        try:
-                            os.unlink(tf)
-                        except OSError:
-                            pass
-                self._gt_uploaded = True
-                logger.info(f"Uploaded {len(gt_videos_uint8)} GT validation videos")
-            except Exception as e:
-                logger.warning(f"Failed to upload GT val videos: {e}")
-                import traceback
-                traceback.print_exc()
-        synchronize()
 
     # ------------------------------------------------------------------
     # Training hooks
