@@ -260,3 +260,51 @@ def test_debug_trace_silent_when_env_var_unset(monkeypatch):
 
     combined = "".join(str(m) for m in messages)
     assert "[lookahead]" not in combined, f"Expected no [lookahead] trace. Captured: {combined!r}"
+
+
+def test_lookahead_does_not_fire_on_chunk_zero():
+    """Regression test: chunk 0 with chunk_size > sink_size should NOT trigger
+    lookahead, because k_win at that point is just the current-chunk K (no
+    cached sink slab).
+
+    Previously bug: sink_tokens < k_win.shape[1] was TRUE (1*fs < 3*fs), so the
+    trigger fired and treated the first frame of chunk 0 as a stale sink to
+    shift — nonsensical because that frame IS the sink currently being generated.
+    """
+    import fastgen.networks.InfiniteTalk.network_causal as ncm
+    from fastgen.networks.InfiniteTalk.network_causal import _apply_window_rope
+
+    B, frame_seqlen = 1, 4
+    sink_frames = 1
+    chunk_frames = 3
+    # k_win is JUST the current chunk (chunk 0 case, no prior cache)
+    k_win = torch.zeros(B, chunk_frames * frame_seqlen, 2, 16)
+    q = torch.zeros(B, chunk_frames * frame_seqlen, 2, 16)
+    grid_sizes = torch.tensor([[chunk_frames, 2, 2]], dtype=torch.long)
+    dummy_freqs = (torch.zeros(64, 4, dtype=torch.complex64),) * 3
+
+    calls = []
+    original_rope = ncm.causal_rope_apply
+    ncm.causal_rope_apply = _make_spy_rope(calls)
+    try:
+        _apply_window_rope(
+            q=q, k_win=k_win, grid_sizes=grid_sizes, freqs=dummy_freqs,
+            frame_seqlen=frame_seqlen,
+            sink_tokens=sink_frames * frame_seqlen,  # 4, less than k_win.shape[1]=12
+            query_offset_in_win=0,  # chunk 0: no offset
+            lookahead_sink_enabled=True, lookahead_distance=4, use_dynamic_rope=True,
+        )
+    finally:
+        ncm.causal_rope_apply = original_rope
+
+    # If lookahead incorrectly fires, we'd see 3 rope calls (sink K, rest K, Q).
+    # Correct behavior: 2 calls (whole-K, Q) — standard dynamic-RoPE path.
+    assert len(calls) == 2, (
+        f"Expected 2 rope calls (lookahead should NOT fire on chunk 0), "
+        f"got {len(calls)} calls: {calls}"
+    )
+    k_call, q_call = calls
+    assert k_call["f"] == chunk_frames
+    assert k_call["start_frame"] == 0
+    assert q_call["f"] == chunk_frames  # q has 3 frames
+    assert q_call["start_frame"] == 0  # query_offset_in_win=0, so q_frame_start=0

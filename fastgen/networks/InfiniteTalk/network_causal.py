@@ -279,10 +279,17 @@ def _apply_window_rope(
         return static_roped_q, static_k_win
 
     F_window = k_win.shape[1] // frame_seqlen
+    # Lookahead applies only when k_win actually contains a cached sink slab at
+    # its front, distinct from the current chunk's K. This is true exactly when
+    # query_offset_in_win > 0 (i.e., we're past chunk 0 and there's prior
+    # cached content in k_win). On chunk 0, k_win is just the current chunk,
+    # so sink_tokens may be < k_win.shape[1] but there's no actual cached
+    # sink slab to shift — we must not fire lookahead in that case.
     use_lookahead = (
         lookahead_sink_enabled
         and sink_tokens > 0
         and sink_tokens < k_win.shape[1]
+        and query_offset_in_win > 0
     )
 
     if use_lookahead:
