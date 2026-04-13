@@ -4,14 +4,18 @@ WandbCallback for InfiniteTalk Self-Forcing training.
 
 Logs SF-specific losses (total_loss, vsd_loss, fake_score_loss, gan_loss_gen)
 every training step, generates AR sample videos at configurable intervals,
-and handles deferred validation video generation to avoid deadlocks in DDP.
+and handles validation video logging with audio muxing + ground-truth reconstruction,
+matching the DF callback's feature set.
 
-DDP constraint: never do expensive work (AR generation) between DDP-synced
-validation forward passes. Store data during on_validation_step_end (instant),
-generate videos in on_validation_end (after DDP loop).
+FSDP constraint: validation_step runs AR generation + VAE decode on all ranks
+(FSDP requires synchronized forward passes). Rank 0 captures the decoded pixel
+tensor in on_validation_step_end, then muxes audio and logs in on_validation_end.
 """
 
 import gc
+import os
+import subprocess
+import tempfile
 import warnings
 from typing import Optional, Callable
 
@@ -20,7 +24,7 @@ import torch
 import wandb
 
 from fastgen.callbacks.callback import Callback
-from fastgen.utils.distributed import is_rank0
+from fastgen.utils.distributed import synchronize, is_rank0
 import fastgen.utils.logging_utils as logger
 
 
@@ -31,9 +35,10 @@ class InfiniteTalkSFWandbCallback(Callback):
       - Log scalar losses on every training step (rank 0 only).
       - At ``sample_logging_iter`` intervals, call the ``gen_rand`` callable
         from ``output_batch`` to produce an AR sample video and log it.
-      - Collect validation ``gen_rand`` callables during ``on_validation_step_end``
-        and generate / log videos in ``on_validation_end`` (deferred generation
-        to stay safe under DDP synchronization).
+      - Upload ground-truth validation videos once at training start.
+      - Capture pre-decoded pixel tensors during ``on_validation_step_end``
+        and log them (with audio muxing + GT reconstruction) in
+        ``on_validation_end``.
     """
 
     def __init__(
@@ -51,9 +56,13 @@ class InfiniteTalkSFWandbCallback(Callback):
         self.audio_fps = audio_fps
         self.vid_format = vid_format
 
-        # Deferred validation storage
-        self._val_gen_rand_fns: list[Callable] = []
+        # Deferred validation storage (rank 0 only)
+        self._val_gen_pixels: list[torch.Tensor] = []   # pre-decoded pixel videos [1,C,T,H,W]
+        self._val_gen_rand_fns: list[Callable] = []     # for callable path (training samples)
+        self._val_real_data: list[torch.Tensor] = []    # GT latents for reconstruction
+        self._val_audio_paths: list[Optional[str]] = []
         self._val_loss_dicts: list[dict[str, torch.Tensor]] = []
+        self._gt_uploaded = False
 
     def on_app_begin(self) -> None:
         """Initialize wandb run (rank 0 only)."""
@@ -66,52 +75,107 @@ class InfiniteTalkSFWandbCallback(Callback):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _tensor_to_wandb_video(
-        tensor: torch.Tensor,
-        fps: int = 25,
-        vid_format: str = "mp4",
-    ) -> Optional[wandb.Video]:
-        """Convert a generated latent/pixel tensor to a ``wandb.Video``.
+    def _mux_video_audio(video_uint8: np.ndarray, audio_path: str, fps: int) -> Optional[str]:
+        """Write video+audio to a temp MP4 file via raw ffmpeg piping.
 
-        Expects tensor of shape ``[B, C, T, H, W]`` or ``[B, T, C, H, W]``
-        in ``[-1, 1]`` range.  Normalises to ``[0, 255]`` uint8,
-        reorders to ``[T, H, W, C]`` numpy, and returns a ``wandb.Video``.
+        Args:
+            video_uint8: [T, C, H, W] uint8 numpy array
+            audio_path: path to audio file (wav/m4a/etc.)
+            fps: video frame rate
+        Returns:
+            Path to muxed MP4, or None on failure. Caller must clean up.
         """
-        if tensor is None:
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except ImportError:
             return None
 
+        # Convert [T, C, H, W] → [T, H, W, C] for raw piping
+        if video_uint8.ndim == 4 and video_uint8.shape[1] == 3:
+            frames = np.transpose(video_uint8, (0, 2, 3, 1))
+        else:
+            frames = video_uint8
+        num_frames, h, w, _ = frames.shape
+
+        tmp_dir = tempfile.mkdtemp()
+        noaudio_path = os.path.join(tmp_dir, "noaudio.mp4")
+        output_path = os.path.join(tmp_dir, "with_audio.mp4")
+
+        try:
+            # Encode raw frames → silent H.264 via stdin pipe
+            cmd = [
+                ffmpeg_exe, "-y",
+                "-f", "rawvideo", "-vcodec", "rawvideo",
+                "-s", f"{w}x{h}", "-pix_fmt", "rgb24", "-r", str(fps),
+                "-i", "-",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+                noaudio_path,
+            ]
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+            for i in range(num_frames):
+                proc.stdin.write(frames[i].tobytes())
+            proc.stdin.close()
+            proc.wait()
+
+            # Mux audio
+            duration = num_frames / fps
+            mux_cmd = [
+                ffmpeg_exe, "-y",
+                "-i", noaudio_path, "-i", audio_path,
+                "-c:v", "copy", "-c:a", "aac",
+                "-t", f"{duration:.3f}", "-shortest",
+                output_path,
+            ]
+            result = subprocess.run(mux_cmd, capture_output=True, timeout=30)
+
+            # Clean up intermediate
+            if os.path.exists(noaudio_path):
+                os.unlink(noaudio_path)
+
+            if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                return output_path
+        except Exception as e:
+            logger.warning(f"Audio muxing failed: {e}")
+
+        # Cleanup on failure
+        import shutil
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+
+    @staticmethod
+    def _to_uint8_video(tensor: torch.Tensor) -> torch.Tensor:
+        """Convert pixel tensor in [-1, 1] to uint8 in [B, T, C, H, W] layout.
+
+        Accepts [B, C, T, H, W] (standard VAE decode output) or a list/tuple of
+        [C, T, H, W] tensors (also a VAE decode return flavor).
+        """
         if isinstance(tensor, (list, tuple)):
             tensor = torch.stack(tensor) if len(tensor) > 1 else tensor[0].unsqueeze(0)
+        # [B, C, T, H, W] → [B, T, C, H, W]
+        t = tensor.permute(0, 2, 1, 3, 4)
+        return t.mul(127.5).add(127.5).clamp(0, 255).to(torch.uint8).cpu()
 
-        # Ensure float for arithmetic
-        t = tensor.detach().float()
+    def _build_wandb_video(
+        self,
+        video_uint8_btchw: torch.Tensor,
+        audio_path: Optional[str],
+    ) -> tuple[Optional[wandb.Video], Optional[str]]:
+        """Build a wandb.Video from an already-uint8 [B, T, C, H, W] tensor.
 
-        # Guard: reject raw latents (16ch) — VAE decode must have failed
-        if t.ndim == 5 and t.shape[1] != 3 and t.shape[2] != 3:
-            warnings.warn(
-                f"_tensor_to_wandb_video: got shape {list(t.shape)} which looks "
-                f"like raw latents (expected 3 channels for pixel video). "
-                f"VAE decode likely failed — skipping video logging.",
-                stacklevel=2,
-            )
-            return None
-
-        # Determine layout: [B, C, T, H, W] vs [B, T, C, H, W]
-        # Heuristic: if dim 1 == 3, it is C-first
-        if t.ndim == 5 and t.shape[1] == 3:
-            # [B, C, T, H, W] -> [B, T, C, H, W]
-            t = t.permute(0, 2, 1, 3, 4)
-
-        # Take first sample in batch
-        t = t[0]  # [T, C, H, W]
-
-        # Normalise [-1, 1] -> [0, 255]
-        t = t.mul(127.5).add(127.5).clamp(0, 255).to(torch.uint8).cpu()
-
-        # [T, C, H, W] -> [T, H, W, C]
-        video_np = t.permute(0, 2, 3, 1).numpy()
-
-        return wandb.Video(video_np, fps=fps, format=vid_format)
+        Muxes audio if ``audio_path`` is provided and exists; otherwise logs
+        silent video. Returns (wandb.Video, tmp_path_to_cleanup_or_None).
+        """
+        if video_uint8_btchw is None:
+            return None, None
+        # Take first sample in batch → [T, C, H, W]
+        video_np = video_uint8_btchw[0].numpy()
+        if audio_path and os.path.exists(audio_path):
+            muxed = self._mux_video_audio(video_np, audio_path, self.audio_fps)
+            if muxed:
+                return wandb.Video(muxed, fps=self.audio_fps, format=self.vid_format), muxed
+        # Fallback: silent video — wandb.Video expects [T, C, H, W]
+        return wandb.Video(video_np, fps=self.audio_fps, format=self.vid_format), None
 
     @staticmethod
     def _safe_item(val) -> float:
@@ -119,6 +183,77 @@ class InfiniteTalkSFWandbCallback(Callback):
         if isinstance(val, torch.Tensor):
             return val.detach().float().item()
         return float(val)
+
+    # ------------------------------------------------------------------
+    # GT upload at training start
+    # ------------------------------------------------------------------
+
+    def on_dataloader_init_end(
+        self, model, dataloader_train, dataloader_val, iteration: int = 0,
+    ) -> None:
+        """Upload ground-truth validation videos at training start (rank 0 only).
+
+        Lazy-loads the VAE via the model's ``_ensure_vae_loaded`` helper so we
+        can decode the precomputed ``real`` latents. If the VAE can't load,
+        defers GT upload to the first validation pass.
+        """
+        if dataloader_val is None:
+            synchronize()
+            return
+
+        # Lazy-load VAE now so we can decode GT. All ranks attempt (each rank has its own VAE)
+        # so that validation_step on non-rank-0 ranks doesn't trigger a second load.
+        if hasattr(model, "_ensure_vae_loaded"):
+            try:
+                model._ensure_vae_loaded()
+            except Exception as e:
+                logger.warning(f"_ensure_vae_loaded during init failed: {e}")
+
+        if not hasattr(model.net, "vae"):
+            if is_rank0():
+                logger.info("No VAE loaded — deferring GT val video upload to first validation")
+            synchronize()
+            return
+
+        if is_rank0():
+            logger.info("Uploading GT validation videos to wandb...")
+            device = model.device
+            try:
+                gt_videos_uint8: list[torch.Tensor] = []
+                audio_paths: list[Optional[str]] = []
+                with torch.no_grad():
+                    for step, data in enumerate(dataloader_val):
+                        real = data["real"].to(device)
+                        decoded = model.net.vae.decode(real[:1].float())
+                        gt_videos_uint8.append(self._to_uint8_video(decoded))
+                        ap = data.get("audio_path")
+                        if ap is not None and isinstance(ap, (list, tuple)):
+                            ap = ap[0]
+                        audio_paths.append(ap)
+
+                if wandb.run:
+                    gt_list: list[wandb.Video] = []
+                    tmp_files: list[str] = []
+                    for vi, v in enumerate(gt_videos_uint8):
+                        vid_obj, tmp = self._build_wandb_video(v, audio_paths[vi])
+                        if vid_obj is not None:
+                            gt_list.append(vid_obj)
+                        if tmp:
+                            tmp_files.append(tmp)
+                    if gt_list:
+                        wandb.log({"val_gt/videos": gt_list}, step=0)
+                    for tf in tmp_files:
+                        try:
+                            os.unlink(tf)
+                        except OSError:
+                            pass
+                self._gt_uploaded = True
+                logger.info(f"Uploaded {len(gt_videos_uint8)} GT validation videos")
+            except Exception as e:
+                logger.warning(f"Failed to upload GT val videos: {e}")
+                import traceback
+                traceback.print_exc()
+        synchronize()
 
     # ------------------------------------------------------------------
     # Training hooks
@@ -152,15 +287,16 @@ class InfiniteTalkSFWandbCallback(Callback):
 
         # --- Sample video logging at configured interval ---
         if iteration > 0 and iteration % self.sample_logging_iter == 0:
-            self._log_train_sample(output_batch, iteration)
+            self._log_train_sample(data_batch, output_batch, iteration)
 
-    def _log_train_sample(self, output_batch: dict, iteration: int) -> None:
+    def _log_train_sample(self, data_batch: dict, output_batch: dict, iteration: int) -> None:
         """Generate and log a training sample video from output_batch['gen_rand']."""
         if not is_rank0() or not wandb.run:
             return
         if "gen_rand" not in output_batch:
             return
 
+        tmp_path: Optional[str] = None
         try:
             gen_rand = output_batch["gen_rand"]
             if callable(gen_rand):
@@ -170,9 +306,13 @@ class InfiniteTalkSFWandbCallback(Callback):
             if gen_rand is None:
                 return
 
-            video_obj = self._tensor_to_wandb_video(
-                gen_rand, fps=self.audio_fps, vid_format=self.vid_format
-            )
+            uint8_vid = self._to_uint8_video(gen_rand)
+            # Audio path for muxing (best-effort)
+            audio_path = data_batch.get("audio_path") if isinstance(data_batch, dict) else None
+            if audio_path is not None and isinstance(audio_path, (list, tuple)):
+                audio_path = audio_path[0]
+
+            video_obj, tmp_path = self._build_wandb_video(uint8_vid, audio_path)
             if video_obj is not None:
                 wandb.log({"train_media/student_generation": video_obj}, step=iteration)
                 logger.info(f"Logged training sample video at iteration {iteration}")
@@ -183,6 +323,11 @@ class InfiniteTalkSFWandbCallback(Callback):
                 stacklevel=2,
             )
         finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -200,12 +345,12 @@ class InfiniteTalkSFWandbCallback(Callback):
         iteration: int = 0,
         idx: int = 0,
     ) -> None:
-        """Collect validation gen_rand callables for deferred generation.
+        """Capture pre-decoded pixel tensors + GT + audio path for deferred logging.
 
-        This method runs inside the DDP-synced validation loop on ALL ranks,
-        so it must be instant (no generation, no synchronize).
+        Runs on ALL ranks so losses can be aggregated. Only rank 0 stores
+        visualization data.
         """
-        # Accumulate loss on all ranks (needed for distributed average)
+        # Accumulate loss on all ranks (needed for distributed average later)
         if loss_dict:
             self._val_loss_dicts.append(
                 {k: v.detach().clone() for k, v in loss_dict.items()}
@@ -216,16 +361,25 @@ class InfiniteTalkSFWandbCallback(Callback):
         if not is_rank0():
             return
 
-        # Store the gen_rand callable/tensor for deferred generation
+        # --- Store generated pixel video / callable ---
         if "gen_rand" in output_batch:
             gen_rand = output_batch["gen_rand"]
-            if callable(gen_rand):
-                # Store the callable itself; we will invoke it in on_validation_end
+            if isinstance(gen_rand, torch.Tensor):
+                # Already-decoded pixel video [1, C, T, H, W] from validation_step
+                self._val_gen_pixels.append(gen_rand.detach().clone().cpu())
+            elif callable(gen_rand):
+                # Callable path (unused for current SF validation, kept for safety)
                 self._val_gen_rand_fns.append(gen_rand)
-            elif isinstance(gen_rand, torch.Tensor):
-                # Wrap tensor in a lambda so on_validation_end has a uniform interface
-                captured = gen_rand.detach().clone()
-                self._val_gen_rand_fns.append(lambda _t=captured: _t)
+
+        # --- Store GT latent for reconstruction (only until GT is uploaded) ---
+        if not self._gt_uploaded and "real" in data_batch:
+            self._val_real_data.append(data_batch["real"][:1].detach().clone().cpu())
+
+        # --- Store audio path for muxing ---
+        audio_path = data_batch.get("audio_path")
+        if audio_path is not None and isinstance(audio_path, (list, tuple)):
+            audio_path = audio_path[0]
+        self._val_audio_paths.append(audio_path)
 
     def on_validation_end(
         self,
@@ -233,7 +387,7 @@ class InfiniteTalkSFWandbCallback(Callback):
         iteration: int = 0,
         idx: int = 0,
     ) -> None:
-        """Log validation losses and generate deferred sample videos."""
+        """Log validation losses, mux audio into generated videos, decode GT."""
         # --- Aggregate and log validation losses ---
         if self._val_loss_dicts and is_rank0() and wandb.run:
             try:
@@ -255,54 +409,127 @@ class InfiniteTalkSFWandbCallback(Callback):
                 )
         self._val_loss_dicts = []
 
-        # --- Generate and log deferred validation videos ---
-        if not is_rank0() or not self._val_gen_rand_fns:
-            self._val_gen_rand_fns = []
+        # Early-out on non-rank-0 or when nothing to log
+        if not is_rank0():
+            self._reset_val_buffers()
             return
-
         if not wandb.run:
-            self._val_gen_rand_fns = []
+            self._reset_val_buffers()
+            return
+        if not self._val_gen_pixels and not self._val_gen_rand_fns:
+            self._reset_val_buffers()
             return
 
         logger.info(
-            f"[val_end] Generating {len(self._val_gen_rand_fns)} "
-            f"deferred val videos at iteration {iteration}..."
+            f"[val_end] Logging {len(self._val_gen_pixels) + len(self._val_gen_rand_fns)} "
+            f"val videos at iteration {iteration}..."
         )
 
-        gen_videos: list[wandb.Video] = []
+        device = model.device
+        gen_list: list[wandb.Video] = []
+        tmp_files: list[str] = []
+
+        # --- Pre-decoded pixel videos (SF's standard path via validation_step) ---
+        for i, pixel_video in enumerate(self._val_gen_pixels):
+            try:
+                uint8_vid = self._to_uint8_video(pixel_video)
+                audio_path = self._val_audio_paths[i] if i < len(self._val_audio_paths) else None
+                vid_obj, tmp = self._build_wandb_video(uint8_vid, audio_path)
+                if vid_obj is not None:
+                    gen_list.append(vid_obj)
+                if tmp:
+                    tmp_files.append(tmp)
+            except Exception as e:
+                warnings.warn(
+                    f"InfiniteTalkSFWandbCallback: failed to build gen video {i}: {e}",
+                    stacklevel=2,
+                )
+
+        # --- Callable path (unused by current SF but supported for parity) ---
+        pixel_offset = len(self._val_gen_pixels)
         for i, gen_fn in enumerate(self._val_gen_rand_fns):
             try:
                 with torch.no_grad():
                     result = gen_fn()
                 if result is None:
                     continue
-                video_obj = self._tensor_to_wandb_video(
-                    result, fps=self.audio_fps, vid_format=self.vid_format
+                uint8_vid = self._to_uint8_video(result)
+                audio_idx = pixel_offset + i
+                audio_path = (
+                    self._val_audio_paths[audio_idx]
+                    if audio_idx < len(self._val_audio_paths) else None
                 )
-                if video_obj is not None:
-                    gen_videos.append(video_obj)
+                vid_obj, tmp = self._build_wandb_video(uint8_vid, audio_path)
+                if vid_obj is not None:
+                    gen_list.append(vid_obj)
+                if tmp:
+                    tmp_files.append(tmp)
             except Exception as e:
                 warnings.warn(
-                    f"InfiniteTalkSFWandbCallback: failed to generate val video "
-                    f"{i}: {e}",
+                    f"InfiniteTalkSFWandbCallback: failed to generate val video {i}: {e}",
                     stacklevel=2,
                 )
 
-        if gen_videos:
+        log_dict: dict = {}
+        if gen_list:
+            log_dict[f"val{idx}/generated"] = gen_list
+
+        # --- GT reconstruction (first-time fallback if not uploaded at init) ---
+        if not self._gt_uploaded and self._val_real_data:
             try:
-                wandb.log(
-                    {f"val{idx}/generated": gen_videos},
-                    step=iteration,
-                )
-                logger.info(
-                    f"Logged {len(gen_videos)} val videos at iteration {iteration}"
-                )
+                if not hasattr(model.net, "vae") and hasattr(model, "_ensure_vae_loaded"):
+                    model._ensure_vae_loaded()
+                if hasattr(model.net, "vae"):
+                    gt_videos_uint8: list[torch.Tensor] = []
+                    with torch.no_grad():
+                        for real in self._val_real_data:
+                            decoded = model.net.vae.decode(real.to(device).float())
+                            gt_videos_uint8.append(self._to_uint8_video(decoded))
+                    gt_list: list[wandb.Video] = []
+                    for vi, v in enumerate(gt_videos_uint8):
+                        audio_path = (
+                            self._val_audio_paths[vi]
+                            if vi < len(self._val_audio_paths) else None
+                        )
+                        vid_obj, tmp = self._build_wandb_video(v, audio_path)
+                        if vid_obj is not None:
+                            gt_list.append(vid_obj)
+                        if tmp:
+                            tmp_files.append(tmp)
+                    if gt_list:
+                        log_dict[f"val{idx}/reconstructed"] = gt_list
+                    self._gt_uploaded = True
+                else:
+                    logger.warning("Failed to decode GT: VAE not available")
+            except Exception as e:
+                logger.warning(f"Failed to decode GT: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # --- Upload to wandb ---
+        if log_dict:
+            try:
+                wandb.log(log_dict, step=iteration)
+                logger.info(f"Logged {len(gen_list)} val videos at iteration {iteration}")
             except Exception as e:
                 warnings.warn(
                     f"InfiniteTalkSFWandbCallback: failed to upload val videos: {e}",
                     stacklevel=2,
                 )
 
+        # Clean up temp muxed files
+        for tf in tmp_files:
+            try:
+                os.unlink(tf)
+            except OSError:
+                pass
+
+        self._reset_val_buffers()
+
+    def _reset_val_buffers(self) -> None:
+        self._val_gen_pixels = []
         self._val_gen_rand_fns = []
+        self._val_real_data = []
+        self._val_audio_paths = []
         gc.collect()
         torch.cuda.empty_cache()
