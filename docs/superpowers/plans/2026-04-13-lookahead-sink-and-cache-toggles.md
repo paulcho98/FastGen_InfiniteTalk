@@ -16,6 +16,22 @@ Config fields live on `InfiniteTalkSFModelConfig` (for SF training + validation)
 
 **Tech Stack:** PyTorch 2.8, FSDP2, flash_attn 2.8.3, FlexAttention (for non-AR training path), existing causal-network and causvid machinery.
 
+**Verification strategy (added after initial plan review):**
+
+- **Tasks 4, 5, 6b include verification logging** gated by env var `LOOKAHEAD_DEBUG_TRACE=1`:
+  - `[lookahead]` line in `_apply_window_rope` — logs `F_window`, `sink_tokens`, `sink_pos`, `q_start` when `use_lookahead=True`. **PERMANENT** (kept after verification — useful future debugging tool).
+  - `[sample_loop]` line per (chunk, step) in `_student_sample_loop` and `inference_causal.py::run_inference` — logs `store_kv`, `apply_anchor`, `f2_active`. **EPHEMERAL** (removed in Task 10 after user sign-off).
+- **All verification tests use mock networks or synthetic tensors** — no 14B model loading. Unit tests (Tasks 3-6b) already cover the F2+F3 matrix and RoPE position math via MockNet and monkey-patched `causal_rope_apply`. This is intentional — model loading takes ~5-8 min for FSDP 3×14B and is not required to verify the logic.
+- **Task 9** runs the unit test suite + a synthetic-data integration check that parses the log output and asserts the matrix. ONE valtest run is optional at the end for wandb-integration sanity only.
+- **Task 10** removes the ephemeral `[sample_loop]` traces after user confirms verification output looks correct.
+
+**Execution order (revised 2026-04-13):**
+
+1. **Training-side first:** Tasks 5 → 7 → 8 → 9 (valtest verification). After this, SF training with the new features is ready.
+2. **Inference-side last:** Task 6b → Task 9b (inference CLI smoke test). Plumbs the same logic into the production `inference_causal.py` path.
+3. **Cleanup:** Task 10 removes ephemeral verification traces.
+4. **SKIPPED:** Task 6 (`generator_fn_extrapolation`). That path is only used by `scripts/inference/video_model_inference.py` (generic utility, not InfiniteTalk). Modifying it would be dead work.
+
 ---
 
 ## Key Interaction Tables (reference for all tasks)
@@ -1126,9 +1142,11 @@ Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 
 ---
 
-## Task 6 (LOW PRIORITY): Mirror F2+F3 logic in `generator_fn_extrapolation`
+## Task 6: SKIPPED — `generator_fn_extrapolation`
 
-> **Note:** `generator_fn_extrapolation` is used ONLY by `scripts/inference/video_model_inference.py` (generic multi-segment utility). InfiniteTalk production inference does NOT use it (uses `inference_causal.py::run_inference` instead — see Task 6b). Keeping this task for consistency with the generic path. Skip if short on time.
+> **Decision (2026-04-13):** This task is SKIPPED. `generator_fn_extrapolation` is only used by `scripts/inference/video_model_inference.py`, a generic multi-segment utility that InfiniteTalk does NOT use. Production inference uses `inference_causal.py::run_inference` directly (see Task 6b). Modifying this utility would be dead work for our use case.
+>
+> The remainder of this section is kept as documentation of the intended changes in case someone later wants to extend the generic utility to support F1/F2/F3. Do NOT execute it as part of the current plan.
 
 
 
@@ -1291,7 +1309,9 @@ Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 
 ---
 
-## Task 6b (HIGH PRIORITY): Plumb F1/F2/F3 through `scripts/inference/inference_causal.py`
+## Task 6b: Plumb F1/F2/F3 through `scripts/inference/inference_causal.py` (RUN LAST, AFTER Task 9)
+
+**Execution order note (2026-04-13):** This task runs AFTER training-side Tasks 5, 7, 8, 9 are complete and verified. Rationale: the training/validation path shares the same core logic (`_apply_window_rope`, `_student_sample_loop`); if Task 9 passes, we know the feature logic is correct and porting to inference is mechanical.
 
 **Context:** This is THE production inference path for InfiniteTalk. It constructs `CausalInfiniteTalkWan` directly (bypassing `InfiniteTalkSelfForcingModel._apply_anchor_config`), has its own inline AR loop (lines 644-741), and dynamically sets `model.total_num_frames = num_latent` based on audio duration. Without this task, F1/F2/F3 apply during validation but NOT during production inference.
 
