@@ -110,6 +110,13 @@ class CausVidModel(DMD2Model):
         """
         logger.debug("Using generator_fn in CausVidModel")
 
+        # Read F2/F3 toggles from the net module (set by _apply_anchor_config for
+        # SF/validation path, or directly on the model for inference).
+        import os
+        model_sink_cache = getattr(net, "_model_sink_cache", False)
+        skip_clean_cache = getattr(net, "_skip_clean_cache_pass", False)
+        debug_trace = os.environ.get("LOOKAHEAD_DEBUG_TRACE") == "1"
+
         # cleanup caches before sampling
         net.clear_caches()
 
@@ -118,19 +125,33 @@ class CausVidModel(DMD2Model):
         num_chunks = num_frames // chunk_size
         remaining_size = num_frames % chunk_size
 
-        # initialize all noise using the first timestep
+        num_denoise_steps = len(t_list) - 1  # e.g., 4 for t_list length 5
+        last_step_idx = num_denoise_steps - 1
+
         for i in range(max(1, num_chunks)):
             if num_chunks == 0:
-                # Handle case where num_frames < chunk_size
                 start, end = 0, remaining_size
             else:
-                # Normal chunking logic
                 start = 0 if i == 0 else chunk_size * i + remaining_size
                 end = chunk_size * (i + 1) + remaining_size
 
+            is_sink_chunk = (start == 0)
+            f2_active = model_sink_cache and is_sink_chunk
+            do_cache_pass = (not skip_clean_cache) or f2_active
+
             x_next = x[:, :, start:end, ...]
-            for step in range(len(t_list) - 1):
-                # denoise
+            for step in range(num_denoise_steps):
+                is_last = (step == last_step_idx)
+                store_kv_here = skip_clean_cache and is_last and not f2_active
+                apply_anchor_here = not (f2_active and is_last)
+
+                if debug_trace:
+                    logger.info(
+                        f"[sample_loop] chunk_idx={i} start={start} step={step} "
+                        f"is_last={is_last} store_kv={store_kv_here} "
+                        f"apply_anchor={apply_anchor_here} f2_active={f2_active}"
+                    )
+
                 t_cur = t_list[step].expand(batch_size)
                 x_cur = x_next
                 x_next = net(
@@ -140,45 +161,73 @@ class CausVidModel(DMD2Model):
                     fwd_pred_type="x0",
                     cache_tag="pos",
                     cur_start_frame=start,
-                    store_kv=False,
+                    store_kv=store_kv_here,
                     is_ar=True,
+                    apply_anchor=apply_anchor_here,
                     **kwargs,
                 )
 
-                # update to the next timestep for forward process
                 t_next = t_list[step + 1]
                 if t_next > 0:
                     t_chunk_next = t_next.expand(batch_size)
                     if student_sample_type == "sde":
                         eps_infer = torch.randn_like(x_next)
                     elif student_sample_type == "ode":
-                        eps_infer = net.noise_scheduler.x0_to_eps(xt=x_cur, x0=x_next, t=t_cur)
+                        eps_infer = net.noise_scheduler.x0_to_eps(
+                            xt=x_cur, x0=x_next, t=t_cur
+                        )
                     else:
                         raise NotImplementedError(
                             f"student_sample_type must be one of 'sde', 'ode' but got {student_sample_type}"
                         )
-                    x_next = net.noise_scheduler.forward_process(x_next, eps_infer, t_chunk_next)
-            x[:, :, start:end, ...] = x_next
+                    x_next = net.noise_scheduler.forward_process(
+                        x_next, eps_infer, t_chunk_next
+                    )
 
-            # compute and update the KV cache
-            x_cache = x_next
-            t_cache = t_list[-1].expand(batch_size)
-            if context_noise > 0:
-                # Add context noise to denoised frames before caching
-                t_cache = torch.full((batch_size,), context_noise, device=x.device, dtype=x.dtype)
-                x_cache = net.noise_scheduler.forward_process(x_next, torch.randn_like(x_next), t_cache)
+            # Write displayed output. If F2 is active on this chunk, manually
+            # anchor frame 0 for display (the forward didn't anchor it because
+            # apply_anchor_here=False on the last denoise step).
+            if f2_active and isinstance(condition, dict) and "first_frame_cond" in condition:
+                x_display = x_next.clone()
+                x_display[:, :, 0:1] = condition["first_frame_cond"][:, :, 0:1]
+                x[:, :, start:end, ...] = x_display
+            else:
+                x[:, :, start:end, ...] = x_next
 
-            _ = net(
-                x_cache,
-                t_cache,
-                condition=condition,
-                fwd_pred_type="x0",
-                cache_tag="pos",
-                cur_start_frame=start,
-                store_kv=True,
-                is_ar=True,
-                **kwargs,
-            )
+            if do_cache_pass:
+                x_cache = x_next  # non-anchored when f2_active; anchored otherwise
+                t_cache = t_list[-1].expand(batch_size)
+                if context_noise > 0:
+                    t_cache = torch.full(
+                        (batch_size,), context_noise,
+                        device=x.device, dtype=x.dtype,
+                    )
+                    x_cache = net.noise_scheduler.forward_process(
+                        x_next, torch.randn_like(x_next), t_cache,
+                    )
+                # apply_anchor=False for cache pass when F2 active (preserves
+                # model-generated frame 0 K/V in the cache).
+                apply_anchor_cache = not f2_active
+
+                if debug_trace:
+                    logger.info(
+                        f"[sample_loop] cache_pass chunk_idx={i} start={start} "
+                        f"store_kv=True apply_anchor={apply_anchor_cache} "
+                        f"f2_active={f2_active}"
+                    )
+
+                _ = net(
+                    x_cache,
+                    t_cache,
+                    condition=condition,
+                    fwd_pred_type="x0",
+                    cache_tag="pos",
+                    cur_start_frame=start,
+                    store_kv=True,
+                    is_ar=True,
+                    apply_anchor=apply_anchor_cache,
+                    **kwargs,
+                )
 
         # cleanup caches after full sampling
         net.clear_caches()
