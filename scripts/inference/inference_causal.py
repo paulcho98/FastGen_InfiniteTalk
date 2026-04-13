@@ -158,6 +158,19 @@ def parse_args():
                    help="Disable hard-overwrite of first latent frame with clean "
                         "reference at every denoising step (on by default to match "
                         "original InfiniteTalk inference)")
+    p.add_argument("--use_dynamic_rope", action="store_true",
+                   help="Enable dynamic RoPE on the student (required by --lookahead_sink)")
+    p.add_argument("--lookahead_sink", action="store_true",
+                   help="Place the attention sink at a future RoPE position (F1). "
+                        "Requires --use_dynamic_rope.")
+    p.add_argument("--lookahead_distance", type=int, default=0,
+                   help="Distance in frames for lookahead sink (>= 1 when --lookahead_sink is on).")
+    p.add_argument("--model_sink_cache", action="store_true",
+                   help="Cache model-generated sink K/V (F2). Only the first chunk affected; "
+                        "display video still anchors frame 0.")
+    p.add_argument("--skip_clean_cache_pass", action="store_true",
+                   help="Skip the separate clean-cache forward pass (F3). Last denoise step "
+                        "caches slightly-noisy K/V instead.")
     p.add_argument("--preprocess_mode", type=str, default="crop",
                    choices=["crop", "pad"],
                    help="Preprocessing for raw/video inputs: 'crop' = resize+center-crop "
@@ -593,8 +606,18 @@ def load_diffusion_model(args, num_latent, device, dtype):
         shift=7.0,
         local_attn_size=args.local_attn_size,
         sink_size=args.sink_size,
-        use_dynamic_rope=False,
+        use_dynamic_rope=args.use_dynamic_rope,
+        lookahead_sink_enabled=args.lookahead_sink,
+        lookahead_distance=args.lookahead_distance,
     )
+
+    # F2/F3 toggles — set as post-construction attrs for run_inference to read
+    model._model_sink_cache = args.model_sink_cache
+    model._skip_clean_cache_pass = args.skip_clean_cache_pass
+
+    print(f"  Lookahead sink: {'ON, distance=' + str(args.lookahead_distance) if args.lookahead_sink else 'OFF'}")
+    print(f"  Model-generated sink cache (F2): {'ON' if args.model_sink_cache else 'OFF'}")
+    print(f"  Skip clean cache pass (F3): {'ON' if args.skip_clean_cache_pass else 'OFF'}")
 
     # --- Load DF/SF checkpoint overlay ---
     if args.ckpt_path and os.path.isfile(args.ckpt_path):
@@ -674,33 +697,49 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
           f"= {num_blocks * (num_denoise_steps + 1)} forward passes"
           f"{' (anchor_first_frame=ON)' if anchor_first_frame else ''}")
 
+    # Read toggles from the model (set in load_diffusion_model)
+    import os
+    model_sink_cache = getattr(model, "_model_sink_cache", False)
+    skip_clean_cache = getattr(model, "_skip_clean_cache_pass", False)
+    debug_trace = os.environ.get("LOOKAHEAD_DEBUG_TRACE") == "1"
+    last_step_idx = num_denoise_steps - 1
+
     for block_idx in range(num_blocks):
         cur_start_frame = block_idx * chunk_size
         noisy_input = noise[:, :, cur_start_frame:cur_start_frame + chunk_size]
 
+        is_sink_chunk = (cur_start_frame == 0)
+        f2_active = model_sink_cache and is_sink_chunk
+        do_cache_pass = (not skip_clean_cache) or f2_active
+
         for step_idx in range(num_denoise_steps):
+            is_last = (step_idx == last_step_idx)
+            store_kv_here = skip_clean_cache and is_last and not f2_active
+            apply_anchor_here = not (f2_active and is_last)
+
+            if debug_trace:
+                print(f"[sample_loop] chunk_idx={block_idx} start={cur_start_frame} "
+                      f"step={step_idx} is_last={is_last} store_kv={store_kv_here} "
+                      f"apply_anchor={apply_anchor_here} f2_active={f2_active}")
+
             t_cur = t_list_t[step_idx]
             t_next = t_list_t[step_idx + 1]
 
-            # No pre-forward input anchor: the model expects noisy input at
-            # timestep t_cur. Injecting clean latent without timestep masking
-            # creates a distribution mismatch. The network's forward() handles
-            # frame 0 via output-level replacement (matching SF training).
-
             x0_pred = model(
                 noisy_input,
-                t_cur.expand(B),  # keep float64 to match _student_sample_loop
+                t_cur.expand(B),
                 condition=condition,
                 cur_start_frame=cur_start_frame,
-                store_kv=False,
+                store_kv=store_kv_here,
                 is_ar=True,
                 fwd_pred_type="x0",
+                apply_anchor=apply_anchor_here,
                 use_gradient_checkpointing=False,
             )
 
-            # Network forward() already anchors frame 0 in output.
-            # This is redundant but kept as explicit safety.
-            if anchor_first_frame and cur_start_frame == 0:
+            # Explicit safety anchor (redundant with forward's builtin). Skip when
+            # we're deliberately suppressing anchor via apply_anchor_here.
+            if anchor_first_frame and cur_start_frame == 0 and apply_anchor_here:
                 x0_pred = x0_pred.clone()
                 x0_pred[:, :, 0:1] = first_frame_latent
 
@@ -712,27 +751,41 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
             else:
                 noisy_input = x0_pred
 
-        output[:, :, cur_start_frame:cur_start_frame + chunk_size] = x0_pred
+        # Write displayed output. For F2 on sink chunk, manually anchor frame 0.
+        if f2_active and isinstance(condition, dict) and "first_frame_cond" in condition:
+            x_display = x0_pred.clone()
+            x_display[:, :, 0:1] = first_frame_latent
+            output[:, :, cur_start_frame:cur_start_frame + chunk_size] = x_display
+        else:
+            output[:, :, cur_start_frame:cur_start_frame + chunk_size] = x0_pred
 
-        cache_input = x0_pred
-        t_cache = torch.full((B,), context_noise, device=device, dtype=dtype)
-        if context_noise > 0:
-            cache_eps = torch.randn_like(x0_pred)
-            cache_input = model.noise_scheduler.forward_process(
-                x0_pred, cache_eps,
-                torch.tensor(context_noise, device=device, dtype=torch.float64).expand(B),
+        if do_cache_pass:
+            cache_input = x0_pred  # non-anchored when f2_active
+            t_cache = torch.full((B,), context_noise, device=device, dtype=dtype)
+            if context_noise > 0:
+                cache_eps = torch.randn_like(x0_pred)
+                cache_input = model.noise_scheduler.forward_process(
+                    x0_pred, cache_eps,
+                    torch.tensor(context_noise, device=device, dtype=torch.float64).expand(B),
+                )
+            apply_anchor_cache = not f2_active
+
+            if debug_trace:
+                print(f"[sample_loop] cache_pass chunk_idx={block_idx} "
+                      f"start={cur_start_frame} store_kv=True apply_anchor={apply_anchor_cache} "
+                      f"f2_active={f2_active}")
+
+            model(
+                cache_input,
+                t_cache,
+                condition=condition,
+                cur_start_frame=cur_start_frame,
+                store_kv=True,
+                is_ar=True,
+                fwd_pred_type="x0",
+                apply_anchor=apply_anchor_cache,
+                use_gradient_checkpointing=False,
             )
-
-        model(
-            cache_input,
-            t_cache,
-            condition=condition,
-            cur_start_frame=cur_start_frame,
-            store_kv=True,
-            is_ar=True,
-            fwd_pred_type="x0",
-            use_gradient_checkpointing=False,
-        )
 
         print(f"    Block {block_idx + 1}/{num_blocks} done "
               f"(frames {cur_start_frame}-{cur_start_frame + chunk_size - 1})")
