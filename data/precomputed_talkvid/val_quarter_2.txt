@@ -1,0 +1,2 @@
+data/precomputed_talkvid/data_-_uuPMrdok8_-_uuPMrdok8_835701_840743
+data/precomputed_talkvid/data_-0F1owya2oo_-0F1owya2oo_106956_111998

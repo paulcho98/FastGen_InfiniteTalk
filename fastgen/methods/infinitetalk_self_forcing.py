@@ -168,20 +168,34 @@ class InfiniteTalkSelfForcingModel(SelfForcingModel):
         self._apply_anchor_config()
 
     def _apply_anchor_config(self):
-        """Apply first-frame anchor configuration to student and fake_score.
+        """Apply first-frame anchor configuration to student, teacher, and fake_score.
 
-        Reads config.student_anchor_eval_only (default False):
+        Three independent flags (each defaults to the I2V-always behavior):
+
+        config.student_anchor_eval_only (default False):
           - False: student anchors frame 0 always (current I2V behavior)
           - True: student anchors only in eval mode (inference/validation),
                   no anchor during training → student learns frame 0 via VSD gradient.
 
-        Reads config.fake_score_anchor_eval_only (default False):
+        config.fake_score_anchor_eval_only (default False):
           - False: fake_score always anchors (original behavior)
           - True: fake_score anchors only in eval mode — matches student's soft
                   conditioning so it tracks the student's actual distribution.
 
-        Teacher always anchors (represents the target distribution).
+        config.teacher_anchor_disabled (default False):
+          - False: teacher always anchors (original I2V target distribution)
+          - True: teacher's _enable_first_frame_anchor is permanently set to False.
+                  Teacher never anchors — used to make the VSD target distribution
+                  consistent with an anchor-free training rollout.
+                  (Teacher is always in eval mode, so _anchor_eval_only would
+                  paradoxically leave it anchoring; we use hard-disable instead.)
+
+        Typical "train-time anchor-free, student-anchored eval" mode:
+            student_anchor_eval_only = True
+            fake_score_anchor_eval_only = True
+            teacher_anchor_disabled = True
         """
+        # Student anchor mode
         student_eval_only = getattr(self.config, "student_anchor_eval_only", False)
         if student_eval_only:
             self.net._anchor_eval_only = True
@@ -190,12 +204,22 @@ class InfiniteTalkSelfForcingModel(SelfForcingModel):
             self.net._anchor_eval_only = False
             logger.info("[anchor] Student: always (anchor during training + inference)")
 
+        # Fake_score anchor mode
         fake_eval_only = getattr(self.config, "fake_score_anchor_eval_only", False)
         if fake_eval_only and hasattr(self, "fake_score") and self.fake_score is not None:
             self.fake_score._anchor_eval_only = True
             logger.info("[anchor] Fake score: eval-only (tracks student distribution)")
         else:
             logger.info("[anchor] Fake score: always (anchors during training)")
+
+        # Teacher anchor mode — hard-disable path (eval_only would leave it anchoring
+        # because teacher.training is False)
+        teacher_disabled = getattr(self.config, "teacher_anchor_disabled", False)
+        if teacher_disabled and hasattr(self, "teacher") and self.teacher is not None:
+            self.teacher._enable_first_frame_anchor = False
+            logger.info("[anchor] Teacher: DISABLED (anchor-free target distribution)")
+        else:
+            logger.info("[anchor] Teacher: always (anchors during training rollout)")
 
     @staticmethod
     def _get_free_ram_gb() -> float:

@@ -60,6 +60,22 @@ class InfiniteTalkSFModelConfig(SFModelConfig):
     #         Teacher always anchors regardless (represents target distribution).
     fake_score_anchor_eval_only: bool = False
 
+    # Teacher first-frame anchor disable:
+    #   False (default): teacher always anchors frame 0 (original I2V target distribution)
+    #   True: teacher's _enable_first_frame_anchor is permanently set to False,
+    #         so teacher never anchors — even during training VSD forwards.
+    #
+    # Typical use: combine with student_anchor_eval_only=True and
+    # fake_score_anchor_eval_only=True to produce a train-time anchor-free
+    # pipeline — no model anchors during training, and only the student anchors
+    # during validation / inference. This keeps the VSD target distribution
+    # consistent with the student's actual (non-anchored) training distribution,
+    # while still producing I2V-style outputs at eval.
+    #
+    # Note: teacher is always in eval mode (frozen). Using _anchor_eval_only on it
+    # would paradoxically keep it anchoring, so we use the hard-disable path instead.
+    teacher_anchor_disabled: bool = False
+
     # Gradient accumulation rounds (mirrored from trainer config for combined step scaling)
     grad_accum_rounds: int = 1
 
