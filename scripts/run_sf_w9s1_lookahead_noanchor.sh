@@ -34,7 +34,12 @@ export INFINITETALK_TEACHER_LORA_CKPT="${INFINITETALK_TEACHER_LORA_CKPT:-}"
 export INFINITETALK_STUDENT_LORA_CKPT="${INFINITETALK_STUDENT_LORA_CKPT:-}"
 
 # ── Stage 1 (DF) checkpoint — auto-detect latest ──
-DF_CKPT_DIR="/data/karlo-research_715/workspace/kinemaar/paul/AR_diffusion/reference_FastGen_InfiniteTalk/FastGen_InfiniteTalk/FASTGEN_OUTPUT/DF_InfiniteTalk/infinitetalk_df_quarter/quarter_r128_bs4_accum1_8gpu_0402_0836/checkpoints"
+# Source: the STOCHASTIC DF run. Its config sampled 5 attention configs incl.
+# local_attn_size=10, sink_size=1 (our exact w9s1 setup) with 20% weight. So the
+# student weights are already partially adapted to short-window causal attention.
+# Non-stochastic DF was trained with a single (different) attention config and
+# would be a worse initialization for this experiment.
+DF_CKPT_DIR="/data/karlo-research_715/workspace/kinemaar/paul/AR_diffusion/reference_FastGen_InfiniteTalk/FastGen_InfiniteTalk/FASTGEN_OUTPUT/DF_InfiniteTalk/infinitetalk_df_quarter_stochastic/quarter_stoch_r128_bs4_accum1_8gpu_0409_2248/checkpoints"
 if [ -z "${INFINITETALK_DF_CKPT:-}" ]; then
     INFINITETALK_DF_CKPT=$(ls -1 "$DF_CKPT_DIR"/*.pth 2>/dev/null | sort -V | tail -1)
     if [ -z "$INFINITETALK_DF_CKPT" ]; then
