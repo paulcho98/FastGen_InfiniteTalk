@@ -76,6 +76,41 @@ class InfiniteTalkSFModelConfig(SFModelConfig):
     # would paradoxically keep it anchoring, so we use the hard-disable path instead.
     teacher_anchor_disabled: bool = False
 
+    # Lookahead attention sink (Feature 1):
+    # When True, the sink K/V (stored at buffer positions [0, sink_size) in
+    # frames) is rotated at attention read-time with a RoPE temporal position
+    # equal to F_window - 1 + lookahead_distance, placing it "in the future"
+    # relative to the current generating block.
+    # Requires use_dynamic_rope=True on the student network (the static-RoPE
+    # path cannot retroactively shift cached-key positions).
+    # Only takes effect in chunks past the sink (when k_win has a sink slab).
+    lookahead_sink_enabled: bool = False
+
+    # Distance in frames for lookahead sink. Only meaningful when
+    # lookahead_sink_enabled=True. Typical values 1..8. Must be >= 1 when
+    # lookahead_sink_enabled=True; validated at network construction time.
+    lookahead_distance: int = 0
+
+    # Model-generated sink cache (Feature 2):
+    # When True, the last denoise step of the sink chunk (cur_start_frame=0)
+    # runs with apply_anchor=False, and its output is used as the input to a
+    # subsequent cache-prefill forward pass so the cached sink K/V is computed
+    # from the student's OWN frame-0 prediction (not the reference-image
+    # overwrite). The displayed video still has the reference image at frame 0
+    # (anchor applied manually outside forward). Inference-time only; no effect
+    # during training because anchoring is gated on self.training.
+    model_sink_cache_enabled: bool = False
+
+    # Skip clean-cache pass (Feature 3):
+    # When True, the separate cache-prefill forward pass after each chunk's
+    # denoise loop is skipped. Instead, the last denoise step runs with
+    # store_kv=True, so the K/V cached for that chunk comes from the (slightly
+    # noisy) input to the last denoise step (at t=t_list[-2]).
+    # Saves 1/(sample_steps+1) of inference forwards per chunk.
+    # For the sink chunk, model_sink_cache_enabled=True overrides this setting
+    # and keeps the separate cache pass alive (otherwise F2 cannot function).
+    skip_clean_cache_pass: bool = False
+
     # Gradient accumulation rounds (mirrored from trainer config for combined step scaling)
     grad_accum_rounds: int = 1
 
