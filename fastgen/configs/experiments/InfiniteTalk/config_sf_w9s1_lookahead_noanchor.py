@@ -56,7 +56,9 @@ def create_config():
         la_tag = f"la{config.model.lookahead_distance_min}-{config.model.lookahead_distance_max}"
     else:
         la_tag = f"la{config.model.lookahead_distance}"
-    config.log_config.group = f"infinitetalk_sf_w9s1_lookahead_noanchor{f2_tag}{f3_tag}"
+    # All SF experiments share the canonical group so runs are comparable in
+    # one wandb dashboard. The run name carries the variant tags.
+    config.log_config.group = "infinitetalk_sf"
     run_name = os.environ.get("FASTGEN_RUN_NAME", "")
     if not run_name:
         timestamp = time.strftime("%m%d_%H%M")
