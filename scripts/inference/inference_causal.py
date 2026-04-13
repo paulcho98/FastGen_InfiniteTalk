@@ -137,6 +137,8 @@ def parse_args():
                    help="Context noise for cache update (default: 0.0)")
     p.add_argument("--local_attn_size", type=int, default=-1,
                    help="Rolling attention window in frames (-1=global)")
+    p.add_argument("--sink_size", type=int, default=0,
+                   help="Number of sink frames (always attend to first N frames)")
     p.add_argument("--lora_rank", type=int, default=32,
                    help="LoRA rank (must match trained checkpoint)")
     p.add_argument("--lora_alpha", type=int, default=32,
@@ -590,7 +592,7 @@ def load_diffusion_model(args, num_latent, device, dtype):
         schedule_type="rf",
         shift=7.0,
         local_attn_size=args.local_attn_size,
-        sink_size=0,
+        sink_size=args.sink_size,
         use_dynamic_rope=False,
     )
 

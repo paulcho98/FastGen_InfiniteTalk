@@ -482,9 +482,17 @@ class CausalSelfAttention(nn.Module):
             # -- 3. Handle physical eviction (only when buffer overflows) --
             # This is a FALLBACK for inference with small cache buffers.
             # During training, cache_size == total_tokens, so this never fires.
-            if (
-                store_kv
-                and self.local_attn_size > 0
+            if not store_kv:
+                # Read-only pass (denoising steps): compute where the current
+                # chunk WOULD go (for correct window bounds) but don't modify
+                # the cache buffer.  new_local_start == local_end means the
+                # current tokens aren't in the buffer and will be concatenated
+                # from k_to_cache.  new_local_end includes the current tokens
+                # conceptually so the window math matches the store_kv=True path.
+                new_local_end = local_end + num_new_tokens
+                new_local_start = local_end
+            elif (
+                self.local_attn_size > 0
                 and current_end > global_end
                 and num_new_tokens + local_end > kv_cache_size
             ):
@@ -964,6 +972,7 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         local_attn_size: int = -1,
         sink_size: int = 0,
         use_dynamic_rope: bool = False,
+        stochastic_attn_configs: Optional[list] = None,
         **kwargs,
     ):
         """
@@ -1024,6 +1033,7 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         self.local_attn_size = local_attn_size
         self.sink_size = sink_size
         self.use_dynamic_rope = use_dynamic_rope
+        self._stochastic_attn_configs = stochastic_attn_configs
 
         eps = _COMMON_CFG["eps"]
         patch_size = _COMMON_CFG["patch_size"]
@@ -1281,17 +1291,51 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
     # FlexAttention block mask
     # ------------------------------------------------------------------
 
+    def _sample_attn_config(self) -> dict:
+        """Sample an attention config from stochastic_attn_configs.
+
+        Returns dict with 'local_attn_size' and 'sink_size' keys.
+        Falls back to instance defaults if no stochastic configs.
+        """
+        if not self._stochastic_attn_configs:
+            return {
+                "local_attn_size": self.local_attn_size,
+                "sink_size": self.sink_size,
+            }
+
+        import random
+        weights = [c.get("weight", 1.0) for c in self._stochastic_attn_configs]
+        chosen = random.choices(self._stochastic_attn_configs, weights=weights, k=1)[0]
+        return {
+            "local_attn_size": chosen.get("local_attn_size", self.local_attn_size),
+            "sink_size": chosen.get("sink_size", self.sink_size),
+        }
+
     def _build_block_mask(
         self,
         device: torch.device,
         num_frames: int,
         frame_seqlen: int,
         chunk_size: int = None,
+        local_attn_size: int = -1,
+        sink_size: int = 0,
     ) -> Optional[BlockMask]:
         """Build a chunk-wise causal attention mask for full-sequence mode.
 
         Tokens within the same chunk attend bidirectionally. Tokens can attend
-        to all previous chunks. Matches CausalWan's _prepare_blockwise_causal_attn_mask.
+        to all previous chunks (or a sliding window of previous frames if
+        ``local_attn_size > 0``).
+
+        Args:
+            device: Device to create mask tensors on.
+            num_frames: Number of video frames in the sequence.
+            frame_seqlen: Number of tokens per frame.
+            chunk_size: Chunk size in frames (defaults to ``self.chunk_size``).
+            local_attn_size: Sliding window size in **frames**. Each chunk
+                sees at most this many frames (including itself). ``-1`` means
+                unlimited (full causal, same as original behaviour).
+            sink_size: Number of leading frames that are always visible to
+                every query token, regardless of the sliding window.
         """
         if not FLEX_ATTENTION_AVAILABLE:
             return None
@@ -1301,8 +1345,10 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
 
         total_length = num_frames * frame_seqlen
         pad_len = math.ceil(total_length / 128) * 128 - total_length
+        padded_length = total_length + pad_len
 
-        ends = torch.zeros(total_length + pad_len, device=device, dtype=torch.long)
+        ends = torch.zeros(padded_length, device=device, dtype=torch.long)
+        starts = torch.zeros(padded_length, device=device, dtype=torch.long)
 
         # Build chunk boundaries -- front-load remainder into first chunk
         num_chunks = num_frames // chunk_size
@@ -1319,18 +1365,35 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         current_start = 0
         for frames_in_chunk in frame_counts:
             chunk_len_tokens = frames_in_chunk * frame_seqlen
-            ends[current_start: current_start + chunk_len_tokens] = current_start + chunk_len_tokens
+
+            # --- sliding window lower bound (in tokens) ---
+            if local_attn_size > 0:
+                effective_window = local_attn_size - sink_size
+                chunk_last_frame = (current_start // frame_seqlen) + frames_in_chunk
+                window_start_frame = max(0, chunk_last_frame - effective_window)
+                window_start_token = window_start_frame * frame_seqlen
+            else:
+                window_start_token = 0
+
+            chunk_end = current_start + chunk_len_tokens
+            ends[current_start: chunk_end] = chunk_end
+            starts[current_start: chunk_end] = window_start_token
             current_start += chunk_len_tokens
 
+        # Sink boundary (in tokens): first ``sink_size`` frames always visible
+        sink_end = sink_size * frame_seqlen
+
         def attention_mask(b, h, q_idx, kv_idx):
-            return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
+            in_window = (kv_idx >= starts[q_idx]) & (kv_idx < ends[q_idx])
+            is_sink = kv_idx < sink_end
+            return in_window | is_sink | (q_idx == kv_idx)
 
         block_mask = create_block_mask(
             attention_mask,
             B=None,
             H=None,
-            Q_LEN=total_length + pad_len,
-            KV_LEN=total_length + pad_len,
+            Q_LEN=padded_length,
+            KV_LEN=padded_length,
             _compile=False,
             device=device,
         )
@@ -1516,10 +1579,23 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         # Audio processing
         audio_embedding = self._process_audio(audio, device, x.dtype) if audio is not None else None
 
-        # Build block mask (chunk-wise causal)
-        if self.block_mask is None and FLEX_ATTENTION_AVAILABLE:
+        # Build block mask (chunk-wise causal, optionally stochastic)
+        if self.training and self._stochastic_attn_configs:
+            attn_cfg = self._sample_attn_config()
+            if FLEX_ATTENTION_AVAILABLE:
+                frame_seqlen = h * w
+                self.block_mask = self._build_block_mask(
+                    device, f, frame_seqlen, self.chunk_size,
+                    local_attn_size=attn_cfg["local_attn_size"],
+                    sink_size=attn_cfg["sink_size"],
+                )
+        elif self.block_mask is None and FLEX_ATTENTION_AVAILABLE:
             frame_seqlen = h * w
-            self.block_mask = self._build_block_mask(device, f, frame_seqlen, self.chunk_size)
+            self.block_mask = self._build_block_mask(
+                device, f, frame_seqlen, self.chunk_size,
+                local_attn_size=self.local_attn_size,
+                sink_size=self.sink_size,
+            )
 
         # Create custom forward for gradient checkpointing
         def create_custom_forward(module):
@@ -1681,7 +1757,13 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         for block_index, block in enumerate(self.blocks):
             # Compute cache read position (deterministic, gradient-checkpointing safe)
             kv_cache_i = self._kv_caches[block_index]
-            cache_local_end = current_start  # no eviction: local == global
+            # During training, cache is full-size so local == global (no eviction).
+            # During inference with sliding window, cache is smaller and eviction
+            # shifts data, so local != global. Use None to read from cache metadata.
+            if self.training:
+                cache_local_end = current_start  # no eviction: local == global
+            else:
+                cache_local_end = None  # let attention read from cache metadata
 
             kwargs = dict(
                 e=t_mod,
