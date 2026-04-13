@@ -375,6 +375,11 @@ class CausalSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+        # Lookahead sink (Feature 1) — toggleable, defaults off.
+        # Set externally by CausalInfiniteTalkWan.__init__ during propagation.
+        self.lookahead_sink_enabled: bool = False
+        self.lookahead_distance: int = 0
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1008,6 +1013,8 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         sink_size: int = 0,
         use_dynamic_rope: bool = False,
         stochastic_attn_configs: Optional[list] = None,
+        lookahead_sink_enabled: bool = False,
+        lookahead_distance: int = 0,
         **kwargs,
     ):
         """
@@ -1070,6 +1077,25 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         self.use_dynamic_rope = use_dynamic_rope
         self._stochastic_attn_configs = stochastic_attn_configs
 
+        # Validate lookahead config (Task 3)
+        if lookahead_sink_enabled:
+            if not use_dynamic_rope:
+                raise ValueError(
+                    "lookahead_sink_enabled=True requires use_dynamic_rope=True "
+                    "on the causal student. The static-RoPE path caches keys with "
+                    "absolute positions already applied and cannot retroactively "
+                    "shift the sink's position."
+                )
+            if lookahead_distance < 1:
+                raise ValueError(
+                    f"lookahead_sink_enabled=True requires lookahead_distance >= 1, "
+                    f"got {lookahead_distance}. distance=0 would collide sink with "
+                    f"the last current frame."
+                )
+
+        self._lookahead_sink_enabled = lookahead_sink_enabled
+        self._lookahead_distance = lookahead_distance
+
         eps = _COMMON_CFG["eps"]
         patch_size = _COMMON_CFG["patch_size"]
         text_dim = _COMMON_CFG["text_dim"]
@@ -1114,6 +1140,11 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
             )
             for _ in range(num_layers)
         ])
+
+        # Propagate lookahead config to every block's self-attention module
+        for block in self.blocks:
+            block.self_attn.lookahead_sink_enabled = lookahead_sink_enabled
+            block.self_attn.lookahead_distance = lookahead_distance
 
         # --- Output head ---
         self.head = CausalHead(dim, _COMMON_CFG["out_dim"], patch_size, eps)
