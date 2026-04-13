@@ -221,6 +221,43 @@ class InfiniteTalkSelfForcingModel(SelfForcingModel):
         else:
             logger.info("[anchor] Teacher: always (anchors during training rollout)")
 
+        # --- F1/F2/F3 toggles stamped onto self.net for the sample loops to read ---
+        lookahead_enabled = getattr(self.config, "lookahead_sink_enabled", False)
+        lookahead_distance = getattr(self.config, "lookahead_distance", 0)
+        self.net._lookahead_sink_enabled = lookahead_enabled
+        self.net._lookahead_distance = lookahead_distance
+
+        # Also sync down onto every block's self-attention (runtime override in
+        # case the network was constructed with a different lookahead config).
+        if hasattr(self.net, "blocks"):
+            for block in self.net.blocks:
+                if hasattr(block, "self_attn"):
+                    block.self_attn.lookahead_sink_enabled = lookahead_enabled
+                    block.self_attn.lookahead_distance = lookahead_distance
+
+        if lookahead_enabled:
+            logger.info(
+                f"[attn] Lookahead sink ENABLED, distance={lookahead_distance} frames"
+            )
+        else:
+            logger.info("[attn] Lookahead sink: disabled (standard sink)")
+
+        self.net._model_sink_cache = getattr(
+            self.config, "model_sink_cache_enabled", False
+        )
+        if self.net._model_sink_cache:
+            logger.info("[attn] Model-generated sink cache: ENABLED (F2)")
+        else:
+            logger.info("[attn] Model-generated sink cache: disabled")
+
+        self.net._skip_clean_cache_pass = getattr(
+            self.config, "skip_clean_cache_pass", False
+        )
+        if self.net._skip_clean_cache_pass:
+            logger.info("[attn] Skip clean cache pass: ENABLED (F3)")
+        else:
+            logger.info("[attn] Skip clean cache pass: disabled")
+
     @staticmethod
     def _get_free_ram_gb() -> float:
         """Get free system RAM in GB."""
