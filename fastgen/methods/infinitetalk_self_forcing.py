@@ -224,8 +224,12 @@ class InfiniteTalkSelfForcingModel(SelfForcingModel):
         # --- F1/F2/F3 toggles stamped onto self.net for the sample loops to read ---
         lookahead_enabled = getattr(self.config, "lookahead_sink_enabled", False)
         lookahead_distance = getattr(self.config, "lookahead_distance", 0)
+        lookahead_distance_min = getattr(self.config, "lookahead_distance_min", 0)
+        lookahead_distance_max = getattr(self.config, "lookahead_distance_max", 0)
         self.net._lookahead_sink_enabled = lookahead_enabled
         self.net._lookahead_distance = lookahead_distance
+        self.net._lookahead_distance_min = lookahead_distance_min
+        self.net._lookahead_distance_max = lookahead_distance_max
 
         # Also sync down onto every block's self-attention (runtime override in
         # case the network was constructed with a different lookahead config).
@@ -236,9 +240,16 @@ class InfiniteTalkSelfForcingModel(SelfForcingModel):
                     block.self_attn.lookahead_distance = lookahead_distance
 
         if lookahead_enabled:
-            logger.info(
-                f"[attn] Lookahead sink ENABLED, distance={lookahead_distance} frames"
-            )
+            if lookahead_distance_min > 0 and lookahead_distance_max > 0:
+                logger.info(
+                    f"[attn] Lookahead sink ENABLED, stochastic distance in "
+                    f"[{lookahead_distance_min}, {lookahead_distance_max}] "
+                    f"(eval uses fixed={lookahead_distance})"
+                )
+            else:
+                logger.info(
+                    f"[attn] Lookahead sink ENABLED, distance={lookahead_distance} frames"
+                )
         else:
             logger.info("[attn] Lookahead sink: disabled (standard sink)")
 

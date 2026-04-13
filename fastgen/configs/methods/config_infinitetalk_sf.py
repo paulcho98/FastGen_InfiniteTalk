@@ -89,7 +89,21 @@ class InfiniteTalkSFModelConfig(SFModelConfig):
     # Distance in frames for lookahead sink. Only meaningful when
     # lookahead_sink_enabled=True. Typical values 1..8. Must be >= 1 when
     # lookahead_sink_enabled=True; validated at network construction time.
+    # Used as the DETERMINISTIC distance when lookahead_distance_min /
+    # lookahead_distance_max are both 0 (default). When the range is set AND
+    # self.training=True, the model samples a fresh distance per forward and
+    # ignores this field; when self.training=False (eval/inference), the fixed
+    # lookahead_distance is used regardless of the range for reproducibility.
     lookahead_distance: int = 0
+
+    # Stochastic lookahead distance range [min, max] inclusive. When both > 0,
+    # trains with per-forward sampling of the sink's temporal position — makes
+    # the model robust to lookahead distance variations at inference time.
+    # Defaults (0, 0) disable sampling; training uses the fixed
+    # lookahead_distance. Validated at network construction time:
+    #   both > 0, min <= max, max+total_num_frames <= freqs[0] capacity.
+    lookahead_distance_min: int = 0
+    lookahead_distance_max: int = 0
 
     # Model-generated sink cache (Feature 2):
     # When True, the last denoise step of the sink chunk (cur_start_frame=0)

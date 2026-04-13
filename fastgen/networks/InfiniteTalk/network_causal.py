@@ -1104,6 +1104,8 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         stochastic_attn_configs: Optional[list] = None,
         lookahead_sink_enabled: bool = False,
         lookahead_distance: int = 0,
+        lookahead_distance_min: int = 0,
+        lookahead_distance_max: int = 0,
         **kwargs,
     ):
         """
@@ -1181,9 +1183,24 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
                     f"got {lookahead_distance}. distance=0 would collide sink with "
                     f"the last current frame."
                 )
+            # Validate stochastic lookahead range
+            if lookahead_distance_min > 0 or lookahead_distance_max > 0:
+                if lookahead_distance_min < 1 or lookahead_distance_max < 1:
+                    raise ValueError(
+                        f"stochastic lookahead requires both lookahead_distance_min "
+                        f"and lookahead_distance_max >= 1 (got min={lookahead_distance_min}, "
+                        f"max={lookahead_distance_max}). Set both to 0 to disable sampling."
+                    )
+                if lookahead_distance_min > lookahead_distance_max:
+                    raise ValueError(
+                        f"lookahead_distance_min ({lookahead_distance_min}) must be "
+                        f"<= lookahead_distance_max ({lookahead_distance_max})."
+                    )
 
         self._lookahead_sink_enabled = lookahead_sink_enabled
         self._lookahead_distance = lookahead_distance
+        self._lookahead_distance_min = lookahead_distance_min
+        self._lookahead_distance_max = lookahead_distance_max
 
         eps = _COMMON_CFG["eps"]
         patch_size = _COMMON_CFG["patch_size"]
@@ -2018,6 +2035,32 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         # Gradient checkpointing: default to constructor setting
         if use_gradient_checkpointing is None:
             use_gradient_checkpointing = self._use_gradient_checkpointing
+
+        # --- Stochastic lookahead distance sampling (training only) ---
+        # When a distance range is configured AND we're in training mode, sample
+        # a fresh distance per forward pass and propagate to every block's self-
+        # attention module. Eval/inference uses the fixed self._lookahead_distance
+        # for reproducibility. Mirrors the per-forward _sample_attn_config pattern
+        # used for stochastic_attn_configs.
+        if (
+            self.training
+            and getattr(self, "_lookahead_sink_enabled", False)
+            and getattr(self, "_lookahead_distance_min", 0) > 0
+            and getattr(self, "_lookahead_distance_max", 0) > 0
+        ):
+            import random
+            sampled_distance = random.randint(
+                self._lookahead_distance_min, self._lookahead_distance_max,
+            )
+            for block in self.blocks:
+                if hasattr(block, "self_attn"):
+                    block.self_attn.lookahead_distance = sampled_distance
+            if os.environ.get("LOOKAHEAD_DEBUG_TRACE") == "1":
+                logger.info(
+                    f"[lookahead_sample] training=True distance={sampled_distance} "
+                    f"(range=[{self._lookahead_distance_min}, "
+                    f"{self._lookahead_distance_max}])"
+                )
 
         # Unpack condition
         assert isinstance(condition, dict), f"condition must be a dict, got {type(condition)}"

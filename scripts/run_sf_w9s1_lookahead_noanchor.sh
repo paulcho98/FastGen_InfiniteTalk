@@ -25,6 +25,13 @@ set -e
 export MODEL_SINK_CACHE="${MODEL_SINK_CACHE:-1}"       # F2: model-generated sink K/V
 export SKIP_CLEAN_CACHE="${SKIP_CLEAN_CACHE:-1}"       # F3: skip separate clean-cache pass
 
+# ── Stochastic lookahead distance range (training only) ──
+# Model samples a fresh distance from [min, max] per forward during training.
+# Eval/inference uses the fixed LOOKAHEAD_DISTANCE (default 4). Set either to 0
+# to use the fixed distance during training too.
+export LOOKAHEAD_DISTANCE_MIN="${LOOKAHEAD_DISTANCE_MIN:-1}"
+export LOOKAHEAD_DISTANCE_MAX="${LOOKAHEAD_DISTANCE_MAX:-5}"
+
 # ── Weights ──
 export INFINITETALK_WEIGHTS_DIR="${INFINITETALK_WEIGHTS_DIR:-/data/karlo-research_715/workspace/kinemaar/paul/AR_diffusion/reference_FastGen_InfiniteTalk/InfiniteTalk/weights/Wan2.1-I2V-14B-480P}"
 export INFINITETALK_CKPT="${INFINITETALK_CKPT:-/data/karlo-research_715/workspace/kinemaar/paul/AR_diffusion/reference_FastGen_InfiniteTalk/weights/InfiniteTalk/single/infinitetalk.safetensors}"
@@ -76,7 +83,12 @@ echo "================================================================"
 echo "GPUs:               $NUM_GPUS"
 echo "Student attn:       local_attn_size=10, sink_size=1"
 echo "Dynamic RoPE:       ON (required by lookahead)"
-echo "Lookahead distance: ${LOOKAHEAD_DISTANCE:-4} frames"
+echo "Lookahead distance: ${LOOKAHEAD_DISTANCE:-4} frames (eval/inference fixed value)"
+if [ "${LOOKAHEAD_DISTANCE_MIN:-0}" -gt 0 ] && [ "${LOOKAHEAD_DISTANCE_MAX:-0}" -gt 0 ]; then
+    echo "Lookahead (train):  stochastic, sampled from [$LOOKAHEAD_DISTANCE_MIN, $LOOKAHEAD_DISTANCE_MAX]"
+else
+    echo "Lookahead (train):  deterministic (matches eval)"
+fi
 echo "Anchor (training):  OFF for student, teacher, fake_score"
 echo "Anchor (eval/inf):  ON for student only"
 echo "F2 (model-sink):    ${MODEL_SINK_CACHE:+ON} ${MODEL_SINK_CACHE:-off}"

@@ -51,12 +51,16 @@ def create_config():
     # ---- Logging: distinct group/name to isolate this experiment ----
     f2_tag = "_f2" if config.model.model_sink_cache_enabled else ""
     f3_tag = "_f3" if config.model.skip_clean_cache_pass else ""
+    # Distance tag reflects stochastic mode when range is set, else the fixed distance.
+    if config.model.lookahead_distance_min > 0 and config.model.lookahead_distance_max > 0:
+        la_tag = f"la{config.model.lookahead_distance_min}-{config.model.lookahead_distance_max}"
+    else:
+        la_tag = f"la{config.model.lookahead_distance}"
     config.log_config.group = f"infinitetalk_sf_w9s1_lookahead_noanchor{f2_tag}{f3_tag}"
     run_name = os.environ.get("FASTGEN_RUN_NAME", "")
     if not run_name:
         timestamp = time.strftime("%m%d_%H%M")
-        L = config.model.lookahead_distance
-        run_name = f"sf_w9s1_la{L}_noanchor{f2_tag}{f3_tag}_freq5_lr1e5_{timestamp}"
+        run_name = f"sf_w9s1_{la_tag}_noanchor{f2_tag}{f3_tag}_freq5_lr1e5_{timestamp}"
     config.log_config.name = run_name
 
     return config
