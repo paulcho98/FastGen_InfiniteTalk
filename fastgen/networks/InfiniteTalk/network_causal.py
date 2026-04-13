@@ -928,6 +928,41 @@ _AUDIO_DEFAULTS = dict(
 # CausalInfiniteTalkWan: the student network
 # ---------------------------------------------------------------------------
 
+def _maybe_apply_first_frame_anchor(
+    out: torch.Tensor,
+    net_module,
+    cur_start_frame: int,
+    condition,
+    apply_anchor: bool = True,
+) -> torch.Tensor:
+    """Hard-anchor frame 0 to the clean reference when enabled.
+
+    Modes (instance attributes on net_module):
+      _enable_first_frame_anchor = True (default): anchor is active
+      _enable_first_frame_anchor = False: anchor fully disabled
+      _anchor_eval_only = True: anchor only in eval mode (not during training)
+
+    The explicit ``apply_anchor=False`` argument overrides all of the above —
+    used by the sampling loop's model-generated-sink-cache path to obtain the
+    student's raw frame-0 prediction without the reference overwrite.
+    """
+    if not apply_anchor:
+        return out
+    if cur_start_frame != 0:
+        return out
+    if not isinstance(condition, dict) or "first_frame_cond" not in condition:
+        return out
+    anchor_active = getattr(net_module, "_enable_first_frame_anchor", True)
+    if anchor_active and getattr(net_module, "_anchor_eval_only", False):
+        anchor_active = not net_module.training
+    if not anchor_active:
+        return out
+    first_frame_cond = condition["first_frame_cond"]
+    out = out.clone()
+    out[:, :, 0:1] = first_frame_cond[:, :, 0:1]
+    return out
+
+
 class CausalInfiniteTalkWan(CausalFastGenNetwork):
     """Causal InfiniteTalk DiT for use as the student in Self-Forcing distillation.
 
@@ -1816,6 +1851,7 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         store_kv: bool = False,
         is_ar: bool = True,
         use_gradient_checkpointing: Optional[bool] = None,
+        apply_anchor: bool = True,
         **fwd_kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass -- dispatches to full-sequence or AR mode.
@@ -1838,6 +1874,9 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
             store_kv: Whether to update KV cache.
             is_ar: If True, use AR mode with KV cache; if False, full-sequence.
             use_gradient_checkpointing: Enable gradient checkpointing.
+            apply_anchor: If True (default), apply the frame-0 anchor overwrite
+                when cur_start_frame==0 and network anchor mode allows. If False,
+                bypass the anchor entirely (used by model-generated-sink-cache).
             **fwd_kwargs: Additional kwargs.
 
         Returns:
@@ -1944,20 +1983,12 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
             target_pred_type=fwd_pred_type,
         )
 
-        # Hard-anchor frame 0 to clean reference when processing the first chunk.
-        # Modes (controlled by instance attributes):
-        #   _enable_first_frame_anchor = True (default): anchor is active
-        #   _enable_first_frame_anchor = False: anchor fully disabled
-        #   _anchor_eval_only = True: anchor only in eval mode (not during training)
-        #     This allows the student to learn frame 0 via VSD gradient during SF,
-        #     while still anchoring at inference/validation for quality.
-        anchor_active = getattr(self, "_enable_first_frame_anchor", True)
-        if anchor_active and getattr(self, "_anchor_eval_only", False):
-            anchor_active = not self.training
-        if anchor_active and cur_start_frame == 0 and "first_frame_cond" in condition:
-            first_frame_cond = condition["first_frame_cond"]
-            out = out.clone()
-            out[:, :, 0:1] = first_frame_cond[:, :, 0:1]
+        # Hard-anchor frame 0 to clean reference. Behavior controlled by the
+        # apply_anchor kwarg and net-module attributes; see
+        # _maybe_apply_first_frame_anchor for full semantics.
+        out = _maybe_apply_first_frame_anchor(
+            out, self, cur_start_frame, condition, apply_anchor=apply_anchor,
+        )
 
         # Feature extraction -- return expected structure for DMD2 compatibility
         if return_features_early:
