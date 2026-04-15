@@ -125,6 +125,14 @@ class SelfForcingModel(CausVidModel):
         sample_steps = self.config.student_sample_steps
         dtype = noise.dtype
 
+        # F3 (skip_clean_cache_pass): when enabled, the exit step stores KV
+        # directly (store_kv=True) and the separate clean-latent cache pass at
+        # t=0 (or context_noise) is skipped. Default False → unchanged behavior.
+        # F2 is NOT plumbed here — sink K/V always comes from the anchor-pinned
+        # input at the exit step, which (with apply_input_anchor=True default)
+        # is the clean first-frame latent.
+        skip_clean_cache = getattr(self.net, "_skip_clean_cache_pass", False)
+
         # Sample denoising end steps
         denoising_end_steps = self._sample_denoising_end_steps(num_blocks)
         logger.debug(f"denoising_end_steps: {denoising_end_steps}")
@@ -188,7 +196,9 @@ class SelfForcingModel(CausVidModel):
                         )
                     noisy_input = self.net.noise_scheduler.forward_process(x0_pred_chunk, eps_infer, t_chunk_next)
                 else:
-                    # Exit step: allow gradient if enabled
+                    # Exit step: allow gradient if enabled.
+                    # Under F3 (skip_clean_cache=True), this forward ALSO stores
+                    # KV — replacing the separate clean-cache pass below.
                     enable_grad = (
                         enable_gradient and torch.is_grad_enabled() and (cur_start_frame >= start_gradient_frame)
                     )
@@ -198,7 +208,7 @@ class SelfForcingModel(CausVidModel):
                             t_chunk_cur,
                             condition=condition,
                             cache_tag="pos",
-                            store_kv=False,
+                            store_kv=skip_clean_cache,
                             cur_start_frame=cur_start_frame,
                             fwd_pred_type="x0",
                             is_ar=True,
@@ -208,31 +218,33 @@ class SelfForcingModel(CausVidModel):
             # Save denoised block; keep autograd path by collecting and concatenating later
             denoised_blocks.append(x0_pred_chunk)
 
-            # Update internal KV cache for this finished block using t=0 or context noise (no grads)
-            with torch.no_grad():
-                if self.config.context_noise > 0:
-                    # Add context noise to denoised frames before caching
-                    t_cache = torch.full((batch_size,), self.config.context_noise, device=self.device, dtype=dtype)
-                    x0_pred_cache = self.net.noise_scheduler.forward_process(
-                        x0_pred_chunk,
-                        torch.randn_like(x0_pred_chunk),
-                        t_cache,
-                    )
-                else:
-                    x0_pred_cache = x0_pred_chunk
-                    t_cache = torch.zeros(batch_size, device=self.device, dtype=dtype)
+            # Update internal KV cache for this finished block using t=0 or context noise
+            # (no grads). Skipped when F3 is active — the exit step above already did it.
+            if not skip_clean_cache:
+                with torch.no_grad():
+                    if self.config.context_noise > 0:
+                        # Add context noise to denoised frames before caching
+                        t_cache = torch.full((batch_size,), self.config.context_noise, device=self.device, dtype=dtype)
+                        x0_pred_cache = self.net.noise_scheduler.forward_process(
+                            x0_pred_chunk,
+                            torch.randn_like(x0_pred_chunk),
+                            t_cache,
+                        )
+                    else:
+                        x0_pred_cache = x0_pred_chunk
+                        t_cache = torch.zeros(batch_size, device=self.device, dtype=dtype)
 
-                # update kv-cache with generated frames
-                _ = self.net(
-                    x0_pred_cache,
-                    t_cache,
-                    condition=condition,
-                    cache_tag="pos",
-                    store_kv=True,
-                    cur_start_frame=cur_start_frame,
-                    fwd_pred_type="x0",
-                    is_ar=True,
-                )
+                    # update kv-cache with generated frames
+                    _ = self.net(
+                        x0_pred_cache,
+                        t_cache,
+                        condition=condition,
+                        cache_tag="pos",
+                        store_kv=True,
+                        cur_start_frame=cur_start_frame,
+                        fwd_pred_type="x0",
+                        is_ar=True,
+                    )
 
         # Concatenate blocks along the temporal dimension to form full output with gradients
         output = torch.cat(denoised_blocks, dim=2) if len(denoised_blocks) > 0 else torch.empty_like(noise)
