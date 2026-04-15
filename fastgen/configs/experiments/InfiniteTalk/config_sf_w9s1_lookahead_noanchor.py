@@ -48,6 +48,14 @@ def create_config():
     config.model.fake_score_anchor_eval_only = True
     config.model.teacher_anchor_disabled = True
 
+    # ---- Fake-score (critic) learning rate override ----
+    # Base SF config sets this to 2e-6 (ratio 5:1 vs student lr=1e-5). Bumping
+    # to 4e-6 (ratio 2.5:1) to let the critic track the student's distribution
+    # more responsively — closer to the 14B Wan SF reference of 5e-6.
+    config.model.fake_score_optimizer.lr = float(
+        os.environ.get("FAKE_SCORE_LR", "4e-6")
+    )
+
     # ---- Logging: distinct group/name to isolate this experiment ----
     f2_tag = "_f2" if config.model.model_sink_cache_enabled else ""
     f3_tag = "_f3" if config.model.skip_clean_cache_pass else ""
@@ -56,13 +64,24 @@ def create_config():
         la_tag = f"la{config.model.lookahead_distance_min}-{config.model.lookahead_distance_max}"
     else:
         la_tag = f"la{config.model.lookahead_distance}"
+
+    # LR tags — formatted as e.g. 1e-5 → "1e5", 4e-6 → "4e6". Auto-derives from
+    # config so future lr tweaks surface in the run name without extra edits.
+    def _fmt_lr(lr: float) -> str:
+        return f"{lr:.0e}".replace("-0", "").replace("-", "").replace("+0", "").replace("+", "")
+    student_lr_tag = _fmt_lr(config.model.net_optimizer.lr)
+    fake_lr_tag = _fmt_lr(config.model.fake_score_optimizer.lr)
+
     # All SF experiments share the canonical group so runs are comparable in
     # one wandb dashboard. The run name carries the variant tags.
     config.log_config.group = "infinitetalk_sf"
     run_name = os.environ.get("FASTGEN_RUN_NAME", "")
     if not run_name:
         timestamp = time.strftime("%m%d_%H%M")
-        run_name = f"sf_w9s1_{la_tag}_noanchor{f2_tag}{f3_tag}_freq5_lr1e5_{timestamp}"
+        run_name = (
+            f"sf_w9s1_{la_tag}_noanchor{f2_tag}{f3_tag}"
+            f"_freq5_lr{student_lr_tag}_fs{fake_lr_tag}_{timestamp}"
+        )
     config.log_config.name = run_name
 
     return config
