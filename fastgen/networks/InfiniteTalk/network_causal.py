@@ -1057,6 +1057,49 @@ def _maybe_apply_first_frame_anchor(
     return out
 
 
+def _maybe_apply_input_anchor(
+    x_t: torch.Tensor,
+    net_module,
+    cur_start_frame: int,
+    condition,
+    apply_input_anchor: bool = True,
+) -> torch.Tensor:
+    """Pin x_t[:, :, 0:1] to the clean reference frame when enabled.
+
+    Mirrors _maybe_apply_first_frame_anchor but operates on the forward-pass
+    INPUT (x_t) rather than the output. Applied at the top of forward() so
+    the model always sees clean frame 0 as input — matching InfiniteTalk's
+    training distribution where x_t[:, :, 0] was held clean at every timestep.
+
+    Modes (instance attributes on net_module), identical semantics to output
+    anchor:
+      _enable_first_frame_anchor = True (default): anchor is active
+      _enable_first_frame_anchor = False: anchor fully disabled
+      _anchor_eval_only = True: anchor only in eval mode (not during training)
+
+    The explicit ``apply_input_anchor=False`` argument overrides all of the
+    above — used by F2 (model-sink-cache) paths to let the model see its
+    own drifted frame 0 as input so the cached K/V reflects that behavior.
+
+    Returns the (possibly pinned) tensor. Does not mutate x_t in place.
+    """
+    if not apply_input_anchor:
+        return x_t
+    if cur_start_frame != 0:
+        return x_t
+    if not isinstance(condition, dict) or "first_frame_cond" not in condition:
+        return x_t
+    anchor_active = getattr(net_module, "_enable_first_frame_anchor", True)
+    if anchor_active and getattr(net_module, "_anchor_eval_only", False):
+        anchor_active = not net_module.training
+    if not anchor_active:
+        return x_t
+    first_frame_cond = condition["first_frame_cond"]
+    x_t = x_t.clone()
+    x_t[:, :, 0:1] = first_frame_cond[:, :, 0:1]
+    return x_t
+
+
 class CausalInfiniteTalkWan(CausalFastGenNetwork):
     """Causal InfiniteTalk DiT for use as the student in Self-Forcing distillation.
 
