@@ -16,6 +16,44 @@ Run scripts `export VAR="${VAR:-default}"` BEFORE torchrun. Defaults set in the 
 - `sink_tokens` in `CausalSelfAttention.forward` is a **constant** (`self.sink_size * frame_seqlen`) — does NOT reflect whether `k_win` actually contains a cached sink slab. Any lookahead/stochastic logic that uses it must additionally gate on `query_offset_in_win > 0` to exclude chunk 0.
 - `_apply_anchor_config` runs AFTER FSDP wrapping. Setting `self.net.attr = X` and `block.self_attn.attr = X` both propagate through FSDP transparently.
 
+## Anchor plumbing (input-side + output-side)
+
+Two independent anchor toggles on `CausalInfiniteTalkWan.forward` /
+`InfiniteTalkWan.forward`, both default `True`:
+
+- **`apply_anchor`** (output-side, older): pins `out[:, :, 0:1]` after the model
+  forward. See `_maybe_apply_first_frame_anchor` in `network_causal.py`.
+- **`apply_input_anchor`** (input-side, newer): pins `x_t[:, :, 0:1]` at the top
+  of `forward()` — so the model sees clean frame 0 as INPUT. Matches
+  InfiniteTalk's training distribution (verified: teacher produces garbage at
+  frame 0 without this; see `docs/sf-validation-garbage-output-analysis.md`).
+
+Both respect `_enable_first_frame_anchor` / `_anchor_eval_only` stamped by
+`_apply_anchor_config`. Causal forward additionally gates on
+`cur_start_frame == 0`; bidirectional `forward` unconditionally applies when
+the attribute mode allows.
+
+**F2 interaction:** when F2 (`_model_sink_cache`) wants the cache to capture
+the model's raw prediction, callers must set BOTH `apply_anchor` and
+`apply_input_anchor` to `False` on the same forward. They move in lockstep —
+disabling output anchor alone leaves the cached K/V coming from a clean-pinned
+input, which defeats F2. The sample loops (`causvid.py::_student_sample_loop`
+and `inference_causal.py::run_inference`) already do this correctly; any new
+call site must follow the same pattern.
+
+**Validation/inference path:** `_student_sample_loop` and `run_inference`
+additionally apply a post-`forward_process` pin on chunk 0 (matches
+`multitalk.py:773`). Redundant with the next step's input anchor on
+intermediate denoise steps, but explicitly replicates InfiniteTalk's full
+inference convention.
+
+**Training path:** `SelfForcingModel.rollout_with_gradient` (the actual
+gradient-enabled rollout) calls `self.net(...)` directly and inherits
+`apply_input_anchor=True` via kwarg default — no explicit wiring needed.
+`_student_sample_loop` has a pre-existing `x[:, :, start:end] = x_next`
+in-place pattern that's incompatible with autograd — it's only used under
+`torch.no_grad()` (validation, inference).
+
 ## Dataloader init is slow (NFS)
 `InfiniteTalkDataLoader.__init__` does `torch.load(vae_latents.pt)` for every sample as a shape check. For `train_excl_val30.txt` (~147k samples) this is a full-dataset NFS scan, 20+ min.
 - Validation-only / smoke tests: set train list to `val_quarter_2.txt` (2 samples) AND `config.dataloader_train.raw_data_root = None` (disables the VAE+CLIP+wav2vec load that lazy caching triggers).
