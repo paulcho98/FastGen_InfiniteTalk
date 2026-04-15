@@ -158,6 +158,12 @@ def parse_args():
                    help="Disable hard-overwrite of first latent frame with clean "
                         "reference at every denoising step (on by default to match "
                         "original InfiniteTalk inference)")
+    p.add_argument("--anchor_modes", type=str, default=None,
+                   help="Comma-separated list of anchor modes to run per sample, "
+                        "loading the model once. Choices: 'anchor', 'no_anchor'. "
+                        "When set, each mode writes to <output_dir>/<mode>/. "
+                        "When unset, falls back to --no_anchor_first_frame and "
+                        "writes flat into <output_dir>/. (Batch mode only.)")
     p.add_argument("--use_dynamic_rope", action="store_true",
                    help="Enable dynamic RoPE on the student (required by --lookahead_sink)")
     p.add_argument("--lookahead_sink", action="store_true",
@@ -201,6 +207,20 @@ def parse_args():
         p.error("--t5_path is required when using --prompt")
     if args.num_latent_frames is not None and args.num_latent_frames % args.chunk_size != 0:
         p.error(f"--num_latent_frames ({args.num_latent_frames}) must be divisible by chunk_size ({args.chunk_size})")
+
+    if args.anchor_modes is not None:
+        modes = [m.strip() for m in args.anchor_modes.split(",") if m.strip()]
+        valid = {"anchor", "no_anchor"}
+        bad = [m for m in modes if m not in valid]
+        if bad:
+            p.error(f"--anchor_modes contains invalid entries {bad}; choose from {sorted(valid)}")
+        if not modes:
+            p.error("--anchor_modes must list at least one mode")
+        if args.output_dir is None:
+            p.error("--anchor_modes requires --output_dir (batch mode)")
+        args.anchor_modes = modes
+    else:
+        args.anchor_modes = None
 
     # Resolve dtype
     args.dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
@@ -620,6 +640,11 @@ def load_diffusion_model(args, num_latent, device, dtype):
     print(f"  Skip clean cache pass (F3): {'ON' if args.skip_clean_cache_pass else 'OFF'}")
 
     # --- Load DF/SF checkpoint overlay ---
+    # Expects a monolithic .pth with full state_dict. For FSDP-sharded training
+    # checkpoints (FSDPCheckpointer: `{iter}.pth` sidecar + `{iter}.net_model/`
+    # .distcp shards), first run scripts/inference/consolidate_and_infer.py
+    # (or call dcp_to_torch_save on `{iter}.net_model/`) to produce a
+    # `{iter}_net_consolidated.pth`, then pass THAT as --ckpt_path.
     if args.ckpt_path and os.path.isfile(args.ckpt_path):
         print(f"  Loading checkpoint: {args.ckpt_path}")
         ckpt = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
@@ -633,6 +658,19 @@ def load_diffusion_model(args, num_latent, device, dtype):
                 state_dict = ckpt
         else:
             state_dict = ckpt
+
+        # Guard against accidentally pointing at an FSDPCheckpointer sidecar .pth
+        # (scheduler/grad_scaler/callbacks/iteration only — no model weights).
+        non_model_keys = {"scheduler", "grad_scaler", "callbacks", "iteration"}
+        sd_keys = set(state_dict.keys()) if isinstance(state_dict, dict) else set()
+        if sd_keys and sd_keys.issubset(non_model_keys):
+            sibling = f"{os.path.splitext(args.ckpt_path)[0]}.net_model"
+            raise RuntimeError(
+                f"Checkpoint {args.ckpt_path} has no model weights (keys: {sorted(sd_keys)}). "
+                f"This looks like an FSDPCheckpointer sidecar. "
+                f"Run scripts/inference/consolidate_and_infer.py or dcp_to_torch_save "
+                f"on '{sibling}/' first, then pass the consolidated .pth."
+            )
 
         keys_sample = list(state_dict.keys())[:5]
         print(f"  Checkpoint keys sample: {keys_sample}")
@@ -1032,8 +1070,16 @@ def main():
     model = load_diffusion_model(args, init_num_latent, device, dtype)
 
     # ------------------------------------------------------------------
-    # Step 5: Per-sample inference loop
+    # Step 5: Per-sample inference loop (× anchor modes if requested)
     # ------------------------------------------------------------------
+    # Resolve mode plan: None = single-mode legacy behavior (uses --no_anchor_first_frame).
+    if args.anchor_modes:
+        mode_plan = [(m, m == "anchor") for m in args.anchor_modes]
+        for mode_name, _ in mode_plan:
+            os.makedirs(os.path.join(args.output_dir, mode_name), exist_ok=True)
+    else:
+        mode_plan = [(None, not args.no_anchor_first_frame)]
+
     total = len(sample_dirs)
     for sample_idx, sample_dir in enumerate(sample_dirs):
         print(f"\n{'='*60}")
@@ -1046,7 +1092,23 @@ def main():
               (f": {sample_name}" if sample_name else ""))
         print("=" * 60)
 
-        # Load/resolve condition tensors
+        # Per-mode resume check: skip the whole sample if all modes' outputs already exist.
+        per_mode_paths = []
+        for mode_name, _ in mode_plan:
+            if args.output_dir:
+                name = sample_name or f"sample_{sample_idx}"
+                if mode_name is None:
+                    out_path = os.path.join(args.output_dir, f"{name}.mp4")
+                else:
+                    out_path = os.path.join(args.output_dir, mode_name, f"{name}.mp4")
+            else:
+                out_path = args.output_path
+            per_mode_paths.append(out_path)
+        if all(os.path.exists(p) and os.path.getsize(p) > 0 for p in per_mode_paths):
+            print(f"  All mode outputs already exist, skipping sample.")
+            continue
+
+        # Load/resolve condition tensors (once per sample, reused across modes)
         if raw_encoded_list:
             cond_data = raw_encoded_list[sample_idx]
         elif raw_encoded:
@@ -1071,7 +1133,7 @@ def main():
             num_latent = args.num_latent_frames
             num_video = 1 + (num_latent - 1) * 4
 
-        # Build condition dict
+        # Build condition dict (once per sample, reused across modes)
         te = cond_data.get("text_embeds", text_embeds)
         condition = {
             "text_embeds": te.to(device=device, dtype=dtype),
@@ -1083,35 +1145,37 @@ def main():
         # Update model for variable length
         model.total_num_frames = num_latent
 
-        # Run AR inference
-        print(f"  Running AR inference ({num_latent} latent / {num_video} video frames)...")
-        anchor = not args.no_anchor_first_frame
-        output_latents = run_inference(
-            model, condition, num_latent, args.chunk_size,
-            args.context_noise, args.seed + sample_idx, device, dtype,
-            anchor_first_frame=anchor,
-        )
+        # Run inference once per mode (model loaded once, KV caches cleared per call inside run_inference)
+        for (mode_name, anchor), out_path in zip(mode_plan, per_mode_paths):
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                print(f"  [{mode_name or 'default'}] output exists, skipping: {out_path}")
+                continue
 
-        # Determine output path
-        if args.output_dir:
-            name = sample_name or f"sample_{sample_idx}"
-            out_path = os.path.join(args.output_dir, f"{name}.mp4")
-        else:
-            out_path = args.output_path
+            tag = mode_name if mode_name else ("anchor" if anchor else "no_anchor")
+            print(f"  Running AR inference ({num_latent} latent / {num_video} video frames) "
+                  f"[mode={tag}, anchor={anchor}]...")
+            output_latents = run_inference(
+                model, condition, num_latent, args.chunk_size,
+                args.context_noise, args.seed + sample_idx, device, dtype,
+                anchor_first_frame=anchor,
+            )
 
-        # Decode and save
-        print("  Decoding and saving...")
-        decode_and_save(vae, output_latents, audio_path, out_path, args.fps, device)
-        print(f"  Output: {out_path}")
+            # Decode and save
+            print(f"  Decoding and saving [{tag}]...")
+            decode_and_save(vae, output_latents, audio_path, out_path, args.fps, device)
+            print(f"  Output: {out_path}")
 
-        # Free per-sample tensors
-        del output_latents, condition
+            del output_latents
+            torch.cuda.empty_cache()
+
+        # Free per-sample condition tensors
+        del condition
         torch.cuda.empty_cache()
 
     # Cleanup
     del model
     torch.cuda.empty_cache()
-    print(f"\nDone! Processed {total} sample(s).")
+    print(f"\nDone! Processed {total} sample(s) × {len(mode_plan)} mode(s).")
 
 
 if __name__ == "__main__":
