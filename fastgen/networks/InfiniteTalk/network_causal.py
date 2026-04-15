@@ -2032,6 +2032,7 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         is_ar: bool = True,
         use_gradient_checkpointing: Optional[bool] = None,
         apply_anchor: bool = True,
+        apply_input_anchor: bool = True,
         **fwd_kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass -- dispatches to full-sequence or AR mode.
@@ -2055,8 +2056,14 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
             is_ar: If True, use AR mode with KV cache; if False, full-sequence.
             use_gradient_checkpointing: Enable gradient checkpointing.
             apply_anchor: If True (default), apply the frame-0 anchor overwrite
-                when cur_start_frame==0 and network anchor mode allows. If False,
-                bypass the anchor entirely (used by model-generated-sink-cache).
+                on the model OUTPUT when cur_start_frame==0 and network anchor
+                mode allows. If False, bypass the output anchor (used by F2).
+            apply_input_anchor: If True (default), pin the model INPUT
+                x_t[:, :, 0:1] = first_frame_cond[:, :, 0:1] at the top of
+                forward() when cur_start_frame==0 and network anchor mode
+                allows. Matches InfiniteTalk's training distribution. F2 paths
+                set this to False to let the model see its own drifted frame 0
+                at the cache-store forward.
             **fwd_kwargs: Additional kwargs.
 
         Returns:
@@ -2133,6 +2140,15 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
 
         B, C, T, H, W = x_t.shape
 
+        # Input-side frame-0 anchor: pin x_t[:, :, 0:1] to clean reference
+        # BEFORE any downstream computation. Matches InfiniteTalk training
+        # distribution (clean x[:, :, 0] at every timestep). See
+        # _maybe_apply_input_anchor for modes / gating semantics.
+        x_t = _maybe_apply_input_anchor(
+            x_t, self, cur_start_frame, condition,
+            apply_input_anchor=apply_input_anchor,
+        )
+
         # Build I2V conditioning y-tensor (sliced for chunk in AR mode)
         y = self._build_y(condition, T, start_frame=cur_start_frame)
 
@@ -2156,7 +2172,8 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
                 use_gradient_checkpointing=use_gradient_checkpointing,
             )
         elif is_ar:
-            model_output = self._forward_ar(
+            model_output = CausalInfiniteTalkWan._forward_ar(
+                self,
                 x=x_t,
                 timestep=timestep,
                 context=text_embeds,
