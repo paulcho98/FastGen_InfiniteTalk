@@ -164,6 +164,7 @@ class CausVidModel(DMD2Model):
                     store_kv=store_kv_here,
                     is_ar=True,
                     apply_anchor=apply_anchor_here,
+                    apply_input_anchor=apply_anchor_here,
                     **kwargs,
                 )
 
@@ -183,6 +184,21 @@ class CausVidModel(DMD2Model):
                     x_next = net.noise_scheduler.forward_process(
                         x_next, eps_infer, t_chunk_next
                     )
+
+                    # Post-scheduler-step pin — matches InfiniteTalk's
+                    # multitalk.py:773 convention. Redundant with the next
+                    # step's input anchor but explicitly replicates
+                    # InfiniteTalk's full inference convention for the
+                    # validation/inference path. Only pin on chunk 0 where
+                    # local frame 0 is the global reference frame.
+                    if (
+                        start == 0
+                        and isinstance(condition, dict)
+                        and "first_frame_cond" in condition
+                    ):
+                        ffc = condition["first_frame_cond"]
+                        x_next = x_next.clone()
+                        x_next[:, :, 0:1] = ffc[:, :, 0:1]
 
             # Write displayed output. If F2 is active on this chunk, manually
             # anchor frame 0 for display (the forward didn't anchor it because
@@ -226,6 +242,7 @@ class CausVidModel(DMD2Model):
                     store_kv=True,
                     is_ar=True,
                     apply_anchor=apply_anchor_cache,
+                    apply_input_anchor=apply_anchor_cache,
                     **kwargs,
                 )
 
