@@ -85,6 +85,39 @@ _AUDIO_DEFAULTS = dict(
 
 
 # ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _maybe_apply_input_anchor_bidir(
+    x_t: torch.Tensor,
+    net_module,
+    condition,
+    apply_input_anchor: bool = True,
+) -> torch.Tensor:
+    """Pin x_t[:, :, 0:1] to clean reference for bidirectional teacher/fake.
+
+    Simpler than the causal variant: no cur_start_frame gating — the
+    bidirectional network always operates on a full-length video with
+    frame 0 as the reference.
+
+    See network_causal._maybe_apply_input_anchor for mode semantics.
+    """
+    if not apply_input_anchor:
+        return x_t
+    if not isinstance(condition, dict) or "first_frame_cond" not in condition:
+        return x_t
+    anchor_active = getattr(net_module, "_enable_first_frame_anchor", True)
+    if anchor_active and getattr(net_module, "_anchor_eval_only", False):
+        anchor_active = not net_module.training
+    if not anchor_active:
+        return x_t
+    first_frame_cond = condition["first_frame_cond"]
+    x_t = x_t.clone()
+    x_t[:, :, 0:1] = first_frame_cond[:, :, 0:1]
+    return x_t
+
+
+# ---------------------------------------------------------------------------
 # InfiniteTalkWan: FastGenNetwork wrapper
 # ---------------------------------------------------------------------------
 
@@ -480,6 +513,7 @@ class InfiniteTalkWan(FastGenNetwork):
         feature_indices: Optional[Set[int]] = None,
         return_logvar: bool = False,
         fwd_pred_type: Optional[str] = None,
+        apply_input_anchor: bool = True,
         **fwd_kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass of the InfiniteTalk diffusion score model.
@@ -501,6 +535,11 @@ class InfiniteTalkWan(FastGenNetwork):
             feature_indices: Set of block indices to extract features from.
             return_logvar: If True, return a dummy logvar alongside the output.
             fwd_pred_type: Override prediction type for output conversion.
+            apply_input_anchor: If True (default), pin the model INPUT
+                x_t[:, :, 0:1] = first_frame_cond[:, :, 0:1] at the top of
+                forward() when network anchor mode allows. Matches
+                InfiniteTalk's training distribution (clean frame 0 at every
+                timestep).
             **fwd_kwargs: Additional kwargs (``use_gradient_checkpointing``, etc.).
 
         Returns:
@@ -546,6 +585,13 @@ class InfiniteTalkWan(FastGenNetwork):
             audio_emb = audio_emb[:, center_indices]  # [B, num_frames, 5, 12, 768]
 
         B, C, T, H, W = x_t.shape
+
+        # Input-side frame-0 anchor (bidirectional): pin x_t[:, :, 0:1] to
+        # clean reference before building y and running the model. Matches
+        # InfiniteTalk training distribution for teacher/fake.
+        x_t = _maybe_apply_input_anchor_bidir(
+            x_t, self, condition, apply_input_anchor=apply_input_anchor,
+        )
 
         # --- Build I2V conditioning y-tensor ---
         y = self._build_y(condition, T)  # [B, 20, T, H, W]

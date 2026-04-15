@@ -220,3 +220,65 @@ def test_apply_input_anchor_false_skips_pinning():
 
     assert torch.equal(captured_x["x"], original_x), \
         "apply_input_anchor=False should leave x_t unchanged"
+
+
+def test_bidirectional_input_anchor_kwarg_pins_forward_input():
+    """Verify InfiniteTalkWan (bidirectional) forward applies input anchor."""
+    from fastgen.networks.InfiniteTalk import network as itw_network
+
+    captured = {}
+
+    def fake_model_call(*args, **kwargs):
+        # self.model(x=..., t=..., ...) call site uses keyword args for x.
+        # Capture the x list that gets passed to the underlying wan model.
+        x_list = kwargs.get("x")
+        captured["x_list"] = [xi.detach().clone() for xi in x_list]
+        B = len(x_list)
+        C, T, H, W = x_list[0].shape
+        return torch.zeros(B, C, T, H, W, dtype=x_list[0].dtype, device=x_list[0].device)
+
+    # Build a mock model instance whose __call__ records the args.
+    class _MockInnerModel:
+        patch_size = (1, 2, 2)
+        def __call__(self, *args, **kwargs):
+            return fake_model_call(*args, **kwargs)
+
+    net = SimpleNamespace(
+        _enable_first_frame_anchor=True,
+        _anchor_eval_only=False,
+        training=False,
+        _use_gradient_checkpointing=False,
+        net_pred_type="flow",
+        noise_scheduler=SimpleNamespace(
+            rescale_t=lambda t: t * 1000,
+            convert_model_output=lambda x_t, mo, t, src_pred_type, target_pred_type: mo,
+        ),
+        model=_MockInnerModel(),
+        _build_y=lambda cond, T: torch.zeros(
+            cond["first_frame_cond"].shape[0], 20, T,
+            cond["first_frame_cond"].shape[3], cond["first_frame_cond"].shape[4],
+            dtype=cond["first_frame_cond"].dtype,
+        ),
+    )
+
+    x_t = torch.randn(1, 16, 21, 28, 56)
+    ffc = torch.full((1, 16, 21, 28, 56), 9.0)
+    condition = {
+        "text_embeds": torch.zeros(1, 512, 4096),
+        "clip_features": torch.zeros(1, 257, 1280),
+        "audio_emb": torch.zeros(1, 93, 5, 12, 768),
+        "first_frame_cond": ffc,
+    }
+    t = torch.tensor([0.5])
+
+    _ = itw_network.InfiniteTalkWan.forward(
+        net, x_t, t, condition=condition,
+        apply_input_anchor=True,
+    )
+
+    # x is a list of per-sample tensors; check frame 0 pinned on all
+    assert "x_list" in captured, "inner model was not called"
+    assert len(captured["x_list"]) == 1
+    # Each per-sample tensor has shape [C, T, H, W]; frame 0 at dim 1
+    assert captured["x_list"][0][:, 0].eq(9.0).all(), \
+        "Bidirectional input anchor did NOT pin frame 0"
