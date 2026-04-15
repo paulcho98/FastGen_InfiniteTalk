@@ -121,3 +121,58 @@ def test_f2_overrides_f3_for_sink_chunk():
     assert chunk1[3]["store_kv"] is True
     for c in chunk1:
         assert c["apply_anchor"] is True
+
+
+def test_inference_causal_propagates_apply_input_anchor_f2():
+    """F2 on sink chunk's last denoise + cache pass: both anchors off together."""
+    from scripts.inference import inference_causal
+
+    class _InfSpy:
+        def __init__(self):
+            self.chunk_size = 3
+            self.total_num_frames = 3
+            self._model_sink_cache = True   # F2 active
+            self._skip_clean_cache_pass = False
+            self._kv_caches = None
+            self.calls = []
+            from types import SimpleNamespace
+            self.noise_scheduler = SimpleNamespace(
+                forward_process=lambda x, eps, t: x,
+            )
+
+        def __call__(self, x, t, **kwargs):
+            self.calls.append(dict(kwargs, **{"x_shape": tuple(x.shape)}))
+            return x.clone()
+
+        def clear_caches(self): pass
+
+    spy = _InfSpy()
+    B, C, T, H, W = 1, 16, 3, 8, 8
+    import torch
+    condition = {
+        "text_embeds": torch.zeros(B, 512, 4096),
+        "clip_features": torch.zeros(B, 257, 1280),
+        "audio_emb": torch.zeros(B, 93, 5, 12, 768),
+        "first_frame_cond": torch.full((B, C, 21, H, W), 5.0),
+    }
+    _ = inference_causal.run_inference(
+        spy, condition, num_latent_frames=T, chunk_size=3,
+        context_noise=0.0, seed=42,
+        device="cpu", dtype=torch.float32,
+        anchor_first_frame=True,
+    )
+
+    denoise_calls = [c for c in spy.calls if not c.get("store_kv")]
+    cache_calls = [c for c in spy.calls if c.get("store_kv")]
+
+    assert denoise_calls, "no denoise forwards recorded"
+    # Last denoise on chunk 0 with F2: both anchors off
+    last = denoise_calls[-1]
+    assert last.get("apply_anchor") is False, "F2 last denoise: apply_anchor should be False"
+    assert last.get("apply_input_anchor") is False, \
+        "F2 last denoise: apply_input_anchor should also be False"
+
+    # F2 cache pass: both off
+    assert cache_calls, "expected a cache-store forward"
+    assert cache_calls[-1].get("apply_anchor") is False
+    assert cache_calls[-1].get("apply_input_anchor") is False

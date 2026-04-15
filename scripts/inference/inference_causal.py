@@ -734,6 +734,7 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
                 is_ar=True,
                 fwd_pred_type="x0",
                 apply_anchor=apply_anchor_here,
+                apply_input_anchor=apply_anchor_here,
                 use_gradient_checkpointing=False,
             )
 
@@ -748,6 +749,11 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
                 noisy_input = model.noise_scheduler.forward_process(
                     x0_pred, eps, t_next.expand(B),
                 )
+                # Post-scheduler-step pin — matches InfiniteTalk's
+                # multitalk.py:773 convention on the production AR path.
+                if cur_start_frame == 0 and isinstance(condition, dict) and "first_frame_cond" in condition:
+                    noisy_input = noisy_input.clone()
+                    noisy_input[:, :, 0:1] = first_frame_latent
             else:
                 noisy_input = x0_pred
 
@@ -784,6 +790,7 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
                 is_ar=True,
                 fwd_pred_type="x0",
                 apply_anchor=apply_anchor_cache,
+                apply_input_anchor=apply_anchor_cache,
                 use_gradient_checkpointing=False,
             )
 
