@@ -2172,8 +2172,7 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
                 use_gradient_checkpointing=use_gradient_checkpointing,
             )
         elif is_ar:
-            model_output = CausalInfiniteTalkWan._forward_ar(
-                self,
+            model_output = self._forward_ar(
                 x=x_t,
                 timestep=timestep,
                 context=text_embeds,

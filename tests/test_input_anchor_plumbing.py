@@ -112,25 +112,20 @@ def test_input_anchor_helper_no_condition():
     assert out is x_t, "missing condition should skip pinning"
 
 
-def test_apply_input_anchor_kwarg_pins_forward_input(monkeypatch):
+def test_apply_input_anchor_kwarg_pins_forward_input():
     """Verify CausalInfiniteTalkWan.forward applies input anchor before dispatch."""
     from fastgen.networks.InfiniteTalk import network_causal
 
     captured_x = {}
 
-    def fake_forward_ar(self, x, timestep, context, clip_fea, y, audio,
+    def fake_forward_ar(x, timestep, context, clip_fea, y, audio,
                        current_start, store_kv, use_gradient_checkpointing):
-        # Capture the x that gets passed to the AR forward
+        # Capture the x that gets passed to the AR forward (no self arg —
+        # this is attached directly to the SimpleNamespace, so Python
+        # doesn't auto-bind)
         captured_x["x"] = x.detach().clone()
-        # Return a dummy tensor matching expected output shape
         B, C, T, H, W = x.shape
         return torch.zeros(B, C, T, H, W, dtype=x.dtype, device=x.device)
-
-    monkeypatch.setattr(
-        network_causal.CausalInfiniteTalkWan,
-        "_forward_ar",
-        fake_forward_ar,
-    )
 
     # Build a minimal-mocked instance
     net = SimpleNamespace(
@@ -150,6 +145,7 @@ def test_apply_input_anchor_kwarg_pins_forward_input(monkeypatch):
         ),
         _build_y=lambda cond, T, start_frame: torch.zeros(cond["first_frame_cond"].shape[0], 20, T, cond["first_frame_cond"].shape[3], cond["first_frame_cond"].shape[4], dtype=cond["first_frame_cond"].dtype),
     )
+    net._forward_ar = fake_forward_ar  # attach directly so self._forward_ar resolves
 
     # x_t has noisy frame 0
     x_t = torch.randn(1, 16, 3, 28, 56)  # chunk of 3 frames
@@ -178,23 +174,18 @@ def test_apply_input_anchor_kwarg_pins_forward_input(monkeypatch):
         "Non-frame-0 positions were unexpectedly pinned"
 
 
-def test_apply_input_anchor_false_skips_pinning(monkeypatch):
+def test_apply_input_anchor_false_skips_pinning():
     """Verify apply_input_anchor=False leaves x_t untouched."""
     from fastgen.networks.InfiniteTalk import network_causal
 
     captured_x = {}
 
-    def fake_forward_ar(self, x, timestep, context, clip_fea, y, audio,
+    def fake_forward_ar(x, timestep, context, clip_fea, y, audio,
                        current_start, store_kv, use_gradient_checkpointing):
+        # No self arg — attached directly to the SimpleNamespace instance
         captured_x["x"] = x.detach().clone()
         B, C, T, H, W = x.shape
         return torch.zeros(B, C, T, H, W, dtype=x.dtype, device=x.device)
-
-    monkeypatch.setattr(
-        network_causal.CausalInfiniteTalkWan,
-        "_forward_ar",
-        fake_forward_ar,
-    )
 
     net = SimpleNamespace(
         _enable_first_frame_anchor=True, _anchor_eval_only=False, training=False,
@@ -207,6 +198,7 @@ def test_apply_input_anchor_false_skips_pinning(monkeypatch):
         ),
         _build_y=lambda cond, T, start_frame: torch.zeros(cond["first_frame_cond"].shape[0], 20, T, cond["first_frame_cond"].shape[3], cond["first_frame_cond"].shape[4], dtype=cond["first_frame_cond"].dtype),
     )
+    net._forward_ar = fake_forward_ar  # attach directly so self._forward_ar resolves
 
     original_x = torch.randn(1, 16, 3, 28, 56)
     x_t = original_x.clone()
