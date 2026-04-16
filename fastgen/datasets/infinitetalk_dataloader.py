@@ -861,6 +861,20 @@ class InfiniteTalkDataset(Dataset):
                 return pattern
         return None
 
+    def _resolve_clip_video(self, video_id, clip_start, clip_end):
+        """Find the clip-level video file for a sample.
+
+        Tries ``raw_data_root/data/<video_id>/<video_id>_<start>_<end>.mp4``.
+        Returns the path string, or ``None`` if not found.
+        """
+        if not self._raw_data_root:
+            return None
+        clip_name = f"{video_id}_{clip_start}_{clip_end}.mp4"
+        clip_path = os.path.join(self._raw_data_root, "data", video_id, clip_name)
+        if os.path.isfile(clip_path):
+            return clip_path
+        return None
+
     @staticmethod
     def _read_video_range(video_path, start_frame, num_frames, target_fps=25.0):
         """Read a range of frames from a video, resampled to target_fps.
@@ -905,10 +919,16 @@ class InfiniteTalkDataset(Dataset):
         return np.stack(frames)
 
     def _encode_future_anchor(self, sample_dir, target_h, target_w):
-        """Encode 5 future latent frames past the clip boundary.
+        """Encode 5 future latent frames past the training window.
+
+        The clip files typically contain more frames than the 81-frame training
+        window (e.g. 121 native frames ≈ 126 at 25fps).  We read frames
+        [train_frames - 5, train_frames + 20) in 25fps clip-local coordinates
+        (5 overlap for VAE temporal context + 20 future = 25 total → 7 latent
+        frames, discard first 2, keep 5).
 
         Returns ``[16, 5, H_lat, W_lat]`` bf16 tensor, or ``None`` if the
-        source video doesn't have enough frames.
+        clip doesn't have enough frames.
         """
         basename = os.path.basename(sample_dir)
         parsed = self._parse_sample_dir_name(basename)
@@ -919,30 +939,30 @@ class InfiniteTalkDataset(Dataset):
             )
             return None
 
-        video_id, _clip_start, clip_end = parsed
+        video_id, clip_start, clip_end = parsed
 
-        # Need the full video (not clip file) to get frames past clip_end
-        full_video_path = self._resolve_full_video(video_id)
-        if full_video_path is None:
+        # Find the clip file — it has extra frames beyond the training window
+        clip_path = self._resolve_clip_video(video_id, clip_start, clip_end)
+        if clip_path is None:
             logger.warning(
-                "Lazy cache: full video not found for future anchor: video_id=%s",
+                "Lazy cache: clip file not found for future anchor: video_id=%s",
                 video_id,
             )
             return None
 
-        # Read 25 pixel frames: 5 overlap (VAE temporal context) + 20 future
-        # Starting at clip_end - 5 in the full video.
-        # 25 pixel frames → 7 latent frames via VAE.
-        # Discard first 2 (overlap context), keep 5 future latent frames.
-        read_start = clip_end - 5
+        # Training uses self.num_video_frames (81) at 25fps from the clip start.
+        # We need frames [train_frames - 5, train_frames + 20) in 25fps space,
+        # which is clip-local (the clip file starts at frame 0).
+        train_frames = getattr(self, "num_video_frames", 81)
+        read_start = train_frames - 5  # 76 at 25fps
         needed = 25
 
-        frames = self._read_video_range(full_video_path, read_start, needed)
+        frames = self._read_video_range(clip_path, read_start, needed)
         if frames is None or frames.shape[0] < needed:
             logger.warning(
                 "Lazy cache: not enough frames for future anchor in %s "
-                "(need %d from frame %d)",
-                full_video_path, needed, read_start,
+                "(need %d from frame %d at 25fps, clip has fewer)",
+                clip_path, needed, read_start,
             )
             return None
 

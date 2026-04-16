@@ -476,60 +476,28 @@ def process_sample(
         return "no_video"
 
     # Determine which frames to read:
-    # We need 5 overlap frames from the clip tail + 20 future frames = 25 total.
-    # Overlap starts at (clip_end - 5) in absolute video coords.
-    needed_frames = 25  # 5 overlap + 20 future
+    # Training uses 81 frames at 25fps from the clip start. The clip file
+    # typically has extra frames beyond the training window (e.g. 121 native
+    # frames ≈ 126 at 25fps). We read [train_frames - 5, train_frames + 20)
+    # in 25fps clip-local coordinates.
+    #
+    # NOTE: clip_start/clip_end from the dir name are absolute frame numbers
+    # in the source video, NOT the clip file's local frame count. The clip
+    # file starts at frame 0 in its own coordinate system.
+    train_frames = 81  # training window at 25fps
+    read_start = train_frames - 5  # 76 at 25fps (5 overlap + 20 future)
+    needed_frames = 25
 
-    if is_clip:
-        # Clip file spans [clip_start, clip_end) in its own frame space (0-indexed).
-        # The clip has (clip_end - clip_start) frames.
-        clip_length = clip_end - clip_start
-        # Overlap starts at (clip_length - 5) within the clip file.
-        # BUT the clip file only has clip_length frames, so we cannot read
-        # frames past clip_length. Clip-level files are already trimmed.
-        # We need frames from (clip_length - 5) to (clip_length - 5 + 25 - 1),
-        # but the clip only has up to clip_length - 1. So clip files cannot
-        # provide the future frames — skip to full video if possible.
-        #
-        # Actually, the task says: "If the clip-level file exists, it's already
-        # trimmed to [START, END), so the overlap + future frames start at
-        # offset (END - START) - 5 within the clip file."
-        # This only works if the clip file has MORE than (END - START) frames
-        # (i.e. it was pre-cut with extra padding). Let's try it, and fall back
-        # to the full video if the clip doesn't have enough frames.
-
-        read_start = clip_length - 5
-        frames, _ = load_video_frames_range(
-            video_path, read_start, needed_frames, target_fps
+    frames, _ = load_video_frames_range(
+        video_path, read_start, needed_frames, target_fps
+    )
+    if frames is None:
+        logger.warning(
+            "Clip too short for future anchors: %s "
+            "(need 25 frames from frame %d at 25fps)",
+            basename, read_start,
         )
-        if frames is None:
-            # Clip file too short — try full video
-            full_path = os.path.join(
-                raw_data_root, "videos", f"{video_id}.mp4"
-            )
-            if os.path.isfile(full_path):
-                video_path = full_path
-                is_clip = False
-            else:
-                logger.warning(
-                    "Clip file too short and no full video for %s", basename
-                )
-                return "short"
-
-    if not is_clip:
-        # Full video: frames are in absolute coords.
-        # Read from (clip_end - 5) to (clip_end - 5 + 25 - 1).
-        read_start = clip_end - 5
-        frames, _ = load_video_frames_range(
-            video_path, read_start, needed_frames, target_fps
-        )
-        if frames is None:
-            logger.warning(
-                "Video too short for future anchors: %s "
-                "(need frame %d, video_id=%s)",
-                basename, read_start + needed_frames - 1, video_id,
-            )
-            return "short"
+        return "short"
 
     assert frames.shape[0] == needed_frames, (
         f"Expected {needed_frames} frames, got {frames.shape[0]}"
