@@ -26,25 +26,25 @@ from fastgen.configs.experiments.InfiniteTalk.config_df_quarter_stochastic impor
 def create_config():
     config = create_stochastic_config()
 
-    # Override stochastic configs: 50% with future anchor, 50% without
+    # Override stochastic configs: 50% baseline (with sink), 50% future anchor (no sink).
+    # Future anchor replaces the sink's identity-anchoring role, so sink_size=0 when
+    # anchor is active. Window sizes 6/9/12 match the effective rolling windows of
+    # the baseline configs (which spend 1 or 3 of their budget on sinks).
+    _w_anchor = 0.5 / 3  # 3 anchor configs share 50% total weight
     config.model.net.stochastic_attn_configs = [
-        # Without future anchor (baseline configs)
-        {"local_attn_size": 7,  "sink_size": 1, "weight": 0.1},
-        {"local_attn_size": 10, "sink_size": 1, "weight": 0.1},
-        {"local_attn_size": 13, "sink_size": 1, "weight": 0.1},
-        {"local_attn_size": 9,  "sink_size": 3, "weight": 0.1},
-        {"local_attn_size": 12, "sink_size": 3, "weight": 0.1},
-        # With future anchor (distance-aware conditioning)
-        {"local_attn_size": 10, "sink_size": 1, "weight": 0.1,
+        # Baseline: sink provides identity signal, no future anchor
+        {"local_attn_size": 7,  "sink_size": 1, "weight": 0.1},   # sink=1, rolling=6
+        {"local_attn_size": 10, "sink_size": 1, "weight": 0.1},   # sink=1, rolling=9
+        {"local_attn_size": 13, "sink_size": 1, "weight": 0.1},   # sink=1, rolling=12
+        {"local_attn_size": 9,  "sink_size": 3, "weight": 0.1},   # sink=3, rolling=6
+        {"local_attn_size": 12, "sink_size": 3, "weight": 0.1},   # sink=3, rolling=9
+        # Future anchor: identity from globally-visible GT future frame, no sink
+        {"local_attn_size": 6,  "sink_size": 0, "weight": _w_anchor,
          "future_anchor": True, "future_anchor_distance_range": [1, 5]},
-        {"local_attn_size": 13, "sink_size": 1, "weight": 0.1,
+        {"local_attn_size": 9,  "sink_size": 0, "weight": _w_anchor,
          "future_anchor": True, "future_anchor_distance_range": [1, 5]},
-        {"local_attn_size": 9,  "sink_size": 3, "weight": 0.1,
+        {"local_attn_size": 12, "sink_size": 0, "weight": _w_anchor,
          "future_anchor": True, "future_anchor_distance_range": [1, 5]},
-        {"local_attn_size": 12, "sink_size": 3, "weight": 0.1,
-         "future_anchor": True, "future_anchor_distance_range": [1, 5]},
-        {"local_attn_size": 10, "sink_size": 1, "weight": 0.1,
-         "future_anchor": True, "future_anchor_distance_range": [1, 3]},
     ]
 
     # Logging
