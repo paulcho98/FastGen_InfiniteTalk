@@ -862,8 +862,11 @@ class InfiniteTalkDataset(Dataset):
         return None
 
     @staticmethod
-    def _read_video_range(video_path, start_frame, num_frames):
-        """Read a contiguous range of frames from a video file.
+    def _read_video_range(video_path, start_frame, num_frames, target_fps=25.0):
+        """Read a range of frames from a video, resampled to target_fps.
+
+        ``start_frame`` and ``num_frames`` are in target_fps space.  If the
+        source video's native FPS differs, frame indices are mapped accordingly.
 
         Returns ``[T, H, W, 3]`` uint8 ndarray, or ``None`` if the video is
         too short or cannot be opened.
@@ -873,13 +876,26 @@ class InfiniteTalkDataset(Dataset):
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             return None
+        native_fps = cap.get(cv2.CAP_PROP_FPS) or target_fps
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if start_frame + num_frames > total:
+
+        # Map target-fps frame indices to native-fps source indices
+        if abs(native_fps - target_fps) < 0.5:
+            src_indices = list(range(start_frame, start_frame + num_frames))
+        else:
+            src_indices = [
+                round(i / target_fps * native_fps)
+                for i in range(start_frame, start_frame + num_frames)
+            ]
+
+        # Check bounds
+        if any(idx < 0 or idx >= total for idx in src_indices):
             cap.release()
             return None
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
         frames = []
-        for _ in range(num_frames):
+        for idx in src_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
             ret, frame = cap.read()
             if not ret:
                 cap.release()
