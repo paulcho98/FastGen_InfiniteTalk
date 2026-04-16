@@ -783,8 +783,182 @@ class InfiniteTalkDataset(Dataset):
             _save_atomic(audio_emb, os.path.join(sample_dir, "audio_emb.pt"))
             del audio_emb, audio_array
 
+        # ---- Future anchor latents (extra frames past clip boundary) ----
+        need_future_anchor = not _exists(f"future_anchor_latents{self._vae_suffix}.pt")
+        if need_future_anchor:
+            # Future anchors need frames BEYOND the training clip.
+            # The clip-level video file only has [0, num_video_frames) frames.
+            # We need to find the full source video and read frames past the clip end.
+            #
+            # Strategy: parse sample_dir name to get (video_id, start, end),
+            # resolve the full video, read [end-5, end+20) = 25 frames
+            # (5 overlap for VAE temporal context, 20 future = 5 latent frames).
+            future_anchor = self._encode_future_anchor(sample_dir, target_h, target_w)
+            if future_anchor is not None:
+                _save_atomic(
+                    future_anchor,
+                    os.path.join(sample_dir, f"future_anchor_latents{self._vae_suffix}.pt"),
+                )
+            del future_anchor
+
         # Clean up video data
         del video_tensor, cond_image
+
+    # ------------------------------------------------------------------
+    # Future anchor encoding helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_sample_dir_name(basename):
+        """Parse ``data_VIDEOID_VIDEOID_START_END`` → ``(video_id, start, end)``.
+
+        The sample directory naming convention (set in the precompute script) is::
+
+            os.path.splitext(video_rel.replace("/", "_"))[0]
+
+        where ``video_rel`` looks like ``data/VID_VID/VID_VID_START_END.mp4``.
+        This produces ``data_VID_VID_VID_VID_START_END``.
+
+        Returns (video_id, start, end) or None if unparseable.
+        ``video_id`` is the repeated portion (e.g. ``VID_VID``).
+        """
+        if not basename.startswith("data_"):
+            return None
+        rest = basename[5:]  # strip "data_"
+        # The last two underscore-separated tokens are START and END (ints).
+        parts = rest.rsplit("_", 2)
+        if len(parts) != 3:
+            return None
+        prefix, start_str, end_str = parts
+        try:
+            start = int(start_str)
+            end = int(end_str)
+        except ValueError:
+            return None
+        # prefix should be VID_VID (video_id repeated twice separated by _).
+        # Find the split point where prefix[:i] == prefix[i+1:].
+        for i in range(1, len(prefix)):
+            if prefix[i] == '_' and prefix[:i] == prefix[i + 1:]:
+                return (prefix[:i], start, end)
+        return None
+
+    def _resolve_full_video(self, video_id):
+        """Find the full source video for *video_id* under ``raw_data_root``.
+
+        Tries the directory layout used by the TalkVid dataset::
+
+            raw_data_root/data/<video_id>/<video_id>.mp4
+
+        Returns the path string, or ``None`` if not found.
+        """
+        if not self._raw_data_root:
+            return None
+        for pattern in [
+            os.path.join(self._raw_data_root, "data", video_id, f"{video_id}.mp4"),
+            os.path.join(self._raw_data_root, "videos", f"{video_id}.mp4"),
+        ]:
+            if os.path.isfile(pattern):
+                return pattern
+        return None
+
+    @staticmethod
+    def _read_video_range(video_path, start_frame, num_frames):
+        """Read a contiguous range of frames from a video file.
+
+        Returns ``[T, H, W, 3]`` uint8 ndarray, or ``None`` if the video is
+        too short or cannot be opened.
+        """
+        import cv2
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if start_frame + num_frames > total:
+            cap.release()
+            return None
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        frames = []
+        for _ in range(num_frames):
+            ret, frame = cap.read()
+            if not ret:
+                cap.release()
+                return None
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        cap.release()
+        return np.stack(frames)
+
+    def _encode_future_anchor(self, sample_dir, target_h, target_w):
+        """Encode 5 future latent frames past the clip boundary.
+
+        Returns ``[16, 5, H_lat, W_lat]`` bf16 tensor, or ``None`` if the
+        source video doesn't have enough frames.
+        """
+        basename = os.path.basename(sample_dir)
+        parsed = self._parse_sample_dir_name(basename)
+        if parsed is None:
+            logger.warning(
+                "Lazy cache: cannot parse sample dir name for future anchor: %s",
+                basename,
+            )
+            return None
+
+        video_id, _clip_start, clip_end = parsed
+
+        # Need the full video (not clip file) to get frames past clip_end
+        full_video_path = self._resolve_full_video(video_id)
+        if full_video_path is None:
+            logger.warning(
+                "Lazy cache: full video not found for future anchor: video_id=%s",
+                video_id,
+            )
+            return None
+
+        # Read 25 pixel frames: 5 overlap (VAE temporal context) + 20 future
+        # Starting at clip_end - 5 in the full video.
+        # 25 pixel frames → 7 latent frames via VAE.
+        # Discard first 2 (overlap context), keep 5 future latent frames.
+        read_start = clip_end - 5
+        needed = 25
+
+        frames = self._read_video_range(full_video_path, read_start, needed)
+        if frames is None or frames.shape[0] < needed:
+            logger.warning(
+                "Lazy cache: not enough frames for future anchor in %s "
+                "(need %d from frame %d)",
+                full_video_path, needed, read_start,
+            )
+            return None
+
+        # Resize + center crop (same transform as training frames)
+        video_tensor = _resize_and_center_crop(frames, target_h, target_w)
+        # video_tensor: [3, 25, target_h, target_w] float32
+
+        # VAE encode — same offload pattern as main encoding block
+        device = self._device
+        logger.info("Lazy cache: encoding future anchor VAE for %s", basename)
+        torch.cuda.empty_cache()
+        _move_encoder_to(self._vae, device)
+
+        vae_dtype = getattr(self._vae, "dtype", None) or next(self._vae.model.parameters()).dtype
+        with torch.no_grad():
+            latents = self._vae.encode([video_tensor.to(device=device, dtype=vae_dtype)])
+            if isinstance(latents, (list, tuple)):
+                latents = latents[0]
+            latents = latents.to(torch.bfloat16).cpu()
+
+        _move_encoder_to(self._vae, "cpu")
+        torch.cuda.empty_cache()
+
+        # 25 pixel frames → 7 latent frames. Discard first 2 (overlap context), keep 5.
+        if latents.shape[1] < 7:
+            logger.warning(
+                "Lazy cache: VAE produced only %d latent frames (need 7) for %s",
+                latents.shape[1], basename,
+            )
+            return None
+        future_anchor = latents[:, 2:7]  # [16, 5, H_lat, W_lat]
+        return future_anchor
 
     def __len__(self):
         return len(self.dirs)
@@ -929,6 +1103,29 @@ class InfiniteTalkDataset(Dataset):
         if text_embeds.dim() == 2:
             text_embeds = text_embeds.unsqueeze(0)  # [1, 512, 4096]
 
+        # --- Future anchor latents (optional, for DF lookahead anchoring) ---
+        future_anchor_path = os.path.join(
+            sample_dir, f"future_anchor_latents{self._vae_suffix}.pt"
+        )
+        has_future_anchor = os.path.exists(future_anchor_path)
+        if has_future_anchor:
+            future_anchor_latents = torch.load(
+                future_anchor_path, map_location="cpu", weights_only=False,
+            )
+            if isinstance(future_anchor_latents, dict):
+                future_anchor_latents = next(
+                    v for v in future_anchor_latents.values()
+                    if isinstance(v, torch.Tensor)
+                )
+            future_anchor_latents = future_anchor_latents.to(torch.bfloat16)
+        else:
+            # Zero fallback so default_collate works across mixed batches
+            H_lat = real.shape[2]
+            W_lat = real.shape[3]
+            future_anchor_latents = torch.zeros(
+                16, 5, H_lat, W_lat, dtype=torch.bfloat16
+            )
+
         result = {
             "real": real,
             "first_frame_cond": first_frame_cond,
@@ -936,6 +1133,8 @@ class InfiniteTalkDataset(Dataset):
             "audio_emb": audio_emb,
             "text_embeds": text_embeds,
             "neg_text_embeds": self.neg_text_embeds.clone(),
+            "future_anchor_latents": future_anchor_latents,
+            "has_future_anchor": has_future_anchor,
         }
 
         # --- Source audio path (optional, for wandb video muxing) ---

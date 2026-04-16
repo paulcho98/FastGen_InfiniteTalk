@@ -131,12 +131,16 @@ class InfiniteTalkDiffusionForcingModel(KDModel):
         assert data["audio_emb"].shape[-2:] == (12, 768), (
             f"audio_emb should have shape [..., 12, 768], got {list(data['audio_emb'].shape)}"
         )
-        return {
+        result = {
             "text_embeds": data["text_embeds"],
             "first_frame_cond": data["first_frame_cond"],
             "clip_features": data["clip_features"],
             "audio_emb": data["audio_emb"],
         }
+        # Pass through future anchor latents if available (for DF lookahead anchoring)
+        if "future_anchor_latents" in data:
+            result["future_anchor_latents"] = data["future_anchor_latents"]
+        return result
 
     def _ensure_vae_loaded(self):
         """Lazily load VAE on first call. Must happen AFTER torch.compile finishes.

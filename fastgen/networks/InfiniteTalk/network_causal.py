@@ -484,12 +484,14 @@ class CausalSelfAttention(nn.Module):
         current_start: int = 0,
         store_kv: bool = True,
         cache_local_end_override: Optional[int] = None,
+        num_anchor_tokens: int = 0,
+        anchor_frame_offset: int = 0,
     ) -> torch.Tensor:
         """
         Args:
             x: [B, L, C]
             seq_lens: [B]
-            grid_sizes: [B, 3] -- (F, H, W)
+            grid_sizes: [B, 3] -- (F, H, W) for main tokens only
             freqs: 3D RoPE freq tables
             block_mask: FlexAttention block mask (for full-sequence causal mode)
             kv_cache: dict with 'k', 'v', 'global_end_index', 'local_end_index'
@@ -497,6 +499,11 @@ class CausalSelfAttention(nn.Module):
             store_kv: if True, write to cache and update metadata
             cache_local_end_override: if set, use this as local_end instead of
                 reading from cache (for gradient checkpointing determinism)
+            num_anchor_tokens: number of future-anchor tokens appended after
+                main sequence (full-sequence mode only). 0 = no anchor.
+            anchor_frame_offset: temporal frame index for the anchor RoPE
+                position (e.g. f + future_distance). Only used when
+                num_anchor_tokens > 0.
         """
         b, s, n, d = x.shape[0], x.shape[1], self.num_heads, self.head_dim
 
@@ -506,8 +513,31 @@ class CausalSelfAttention(nn.Module):
 
         if kv_cache is None:
             # ----- Full-sequence mode (training / bidirectional eval) -----
-            roped_q = rope_apply_full(q, grid_sizes, freqs).type_as(v)
-            roped_k = rope_apply_full(k, grid_sizes, freqs).type_as(v)
+            if num_anchor_tokens > 0 and anchor_frame_offset > 0:
+                # Split: main tokens get standard RoPE, anchor gets offset position
+                main_q = q[:, :-num_anchor_tokens]
+                main_k = k[:, :-num_anchor_tokens]
+                anchor_q = q[:, -num_anchor_tokens:]
+                anchor_k = k[:, -num_anchor_tokens:]
+
+                roped_main_q = rope_apply_full(main_q, grid_sizes, freqs).type_as(v)
+                roped_main_k = rope_apply_full(main_k, grid_sizes, freqs).type_as(v)
+
+                # Anchor: 1 frame at position anchor_frame_offset
+                anchor_grid = grid_sizes.clone()
+                anchor_grid[:, 0] = 1  # 1 anchor frame
+                roped_anchor_q = causal_rope_apply(
+                    anchor_q, anchor_grid, freqs, start_frame=anchor_frame_offset,
+                ).type_as(v)
+                roped_anchor_k = causal_rope_apply(
+                    anchor_k, anchor_grid, freqs, start_frame=anchor_frame_offset,
+                ).type_as(v)
+
+                roped_q = torch.cat([roped_main_q, roped_anchor_q], dim=1)
+                roped_k = torch.cat([roped_main_k, roped_anchor_k], dim=1)
+            else:
+                roped_q = rope_apply_full(q, grid_sizes, freqs).type_as(v)
+                roped_k = rope_apply_full(k, grid_sizes, freqs).type_as(v)
 
             if block_mask is not None and FLEX_ATTENTION_AVAILABLE:
                 # FlexAttention path -- chunk-wise causal mask
@@ -856,13 +886,16 @@ class CausalDiTBlock(nn.Module):
         current_start: int = 0,
         store_kv: bool = True,
         cache_local_end_override: Optional[int] = None,
+        num_anchor_tokens: int = 0,
+        anchor_frame_offset: int = 0,
     ) -> torch.Tensor:
         """
         Args:
-            x: [B, L, C]
-            e: [B, F, 6, C] -- per-frame timestep modulation
+            x: [B, L, C]  (L may include anchor tokens)
+            e: [B, F, 6, C] -- per-frame timestep modulation (F includes
+               anchor frame when num_anchor_tokens > 0)
             seq_lens: [B]
-            grid_sizes: [B, 3]
+            grid_sizes: [B, 3] -- (F_main, H, W) for main tokens only
             freqs: RoPE freq tables
             context: [B, L_ctx, C] -- [CLIP(257) | text(512)]
             context_lens: [B] or None
@@ -872,6 +905,10 @@ class CausalDiTBlock(nn.Module):
             current_start: token offset for causal RoPE (AR mode only)
             store_kv: whether to update KV cache
             cache_local_end_override: for gradient checkpointing determinism
+            num_anchor_tokens: number of future-anchor tokens appended after
+                main sequence (full-sequence mode only). 0 = no anchor.
+            anchor_frame_offset: temporal frame index for the anchor RoPE
+                position. Only used when num_anchor_tokens > 0.
         """
         dtype = x.dtype
         num_frames = e.shape[1]
@@ -902,6 +939,8 @@ class CausalDiTBlock(nn.Module):
             current_start,
             store_kv=store_kv,
             cache_local_end_override=cache_local_end_override,
+            num_anchor_tokens=num_anchor_tokens,
+            anchor_frame_offset=anchor_frame_offset,
         )
 
         with torch.amp.autocast('cuda', dtype=torch.float32):
@@ -912,16 +951,31 @@ class CausalDiTBlock(nn.Module):
         x = x.to(dtype)
 
         # --- Cross-attention (text + CLIP image) ---
+        # Cross-attention operates per-token (no grid reshape), so anchor
+        # tokens naturally cross-attend to text/CLIP alongside main tokens.
         x = x + self.cross_attn(self.norm3(x), context, context_lens)
 
         # --- Audio cross-attention ---
+        # Audio cross-attn reshapes x using grid_sizes (N_t, N_h, N_w) which
+        # only covers main tokens. Strip anchor tokens before, reattach after.
         if audio_embedding is not None:
-            x_a = self.audio_cross_attn(
-                self.norm_x(x),
-                encoder_hidden_states=audio_embedding,
-                shape=grid_sizes[0],
-            )
-            x = x + x_a
+            if num_anchor_tokens > 0:
+                x_main = x[:, :-num_anchor_tokens]
+                x_anchor = x[:, -num_anchor_tokens:]
+                x_a = self.audio_cross_attn(
+                    self.norm_x(x_main),
+                    encoder_hidden_states=audio_embedding,
+                    shape=grid_sizes[0],
+                )
+                x_main = x_main + x_a
+                x = torch.cat([x_main, x_anchor], dim=1)
+            else:
+                x_a = self.audio_cross_attn(
+                    self.norm_x(x),
+                    encoder_hidden_states=audio_embedding,
+                    shape=grid_sizes[0],
+                )
+                x = x + x_a
 
         # --- FFN with per-frame AdaLN modulation ---
         norm_x = self.norm2(x).float()
@@ -1509,7 +1563,9 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
     def _sample_attn_config(self) -> dict:
         """Sample an attention config from stochastic_attn_configs.
 
-        Returns dict with 'local_attn_size' and 'sink_size' keys.
+        Returns dict with 'local_attn_size' and 'sink_size' keys, and
+        optionally 'future_anchor' and 'future_anchor_distance' when the
+        chosen config enables future anchor injection.
         Falls back to instance defaults if no stochastic configs.
         """
         if not self._stochastic_attn_configs:
@@ -1521,10 +1577,15 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         import random
         weights = [c.get("weight", 1.0) for c in self._stochastic_attn_configs]
         chosen = random.choices(self._stochastic_attn_configs, weights=weights, k=1)[0]
-        return {
+        result = {
             "local_attn_size": chosen.get("local_attn_size", self.local_attn_size),
             "sink_size": chosen.get("sink_size", self.sink_size),
         }
+        if chosen.get("future_anchor", False):
+            result["future_anchor"] = True
+            dist_range = chosen.get("future_anchor_distance_range", [1, 5])
+            result["future_anchor_distance"] = random.randint(dist_range[0], dist_range[1])
+        return result
 
     def _build_block_mask(
         self,
@@ -1534,6 +1595,7 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         chunk_size: int = None,
         local_attn_size: int = -1,
         sink_size: int = 0,
+        num_anchor_tokens: int = 0,
     ) -> Optional[BlockMask]:
         """Build a chunk-wise causal attention mask for full-sequence mode.
 
@@ -1551,6 +1613,10 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
                 unlimited (full causal, same as original behaviour).
             sink_size: Number of leading frames that are always visible to
                 every query token, regardless of the sliding window.
+            num_anchor_tokens: Number of anchor tokens appended after the main
+                sequence. Anchor tokens are globally visible — they attend to
+                all tokens and all tokens attend to them. When 0, the mask is
+                identical to the original (no anchor support).
         """
         if not FLEX_ATTENTION_AVAILABLE:
             return None
@@ -1558,7 +1624,9 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         if chunk_size is None:
             chunk_size = self.chunk_size
 
-        total_length = num_frames * frame_seqlen
+        total_main = num_frames * frame_seqlen
+        total_with_anchor = total_main + num_anchor_tokens
+        total_length = total_with_anchor
         pad_len = math.ceil(total_length / 128) * 128 - total_length
         padded_length = total_length + pad_len
 
@@ -1595,13 +1663,28 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
             starts[current_start: chunk_end] = window_start_token
             current_start += chunk_len_tokens
 
+        # Anchor tokens: globally visible — see everything, seen by everything
+        if num_anchor_tokens > 0:
+            anchor_start = total_main
+            anchor_end = total_main + num_anchor_tokens
+            # Anchor queries can see the entire sequence (main + other anchors)
+            ends[anchor_start:anchor_end] = total_with_anchor
+            starts[anchor_start:anchor_end] = 0
+
         # Sink boundary (in tokens): first ``sink_size`` frames always visible
         sink_end = sink_size * frame_seqlen
+
+        # FlexAttention JIT-compiles the mask function — captured variables
+        # must be tensors, not Python ints.
+        _total_main = torch.tensor(total_main, device=device, dtype=torch.long)
+        _total_with_anchor = torch.tensor(total_with_anchor, device=device, dtype=torch.long)
 
         def attention_mask(b, h, q_idx, kv_idx):
             in_window = (kv_idx >= starts[q_idx]) & (kv_idx < ends[q_idx])
             is_sink = kv_idx < sink_end
-            return in_window | is_sink | (q_idx == kv_idx)
+            is_anchor_kv = (kv_idx >= _total_main) & (kv_idx < _total_with_anchor)
+            is_anchor_q = (q_idx >= _total_main) & (q_idx < _total_with_anchor)
+            return in_window | is_sink | is_anchor_kv | is_anchor_q | (q_idx == kv_idx)
 
         block_mask = create_block_mask(
             attention_mask,
@@ -1706,6 +1789,7 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         y: Optional[torch.Tensor] = None,
         audio: Optional[torch.Tensor] = None,
         use_gradient_checkpointing: bool = False,
+        future_anchor_latents: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Full-sequence forward -- like bidirectional but with causal block mask.
 
@@ -1720,6 +1804,9 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
             y: [B, 20, T, H, W] I2V conditioning
             audio: [B, num_audio_frames, audio_window, 12, 768]
             use_gradient_checkpointing: enable gradient checkpointing
+            future_anchor_latents: [B, 16, N_future, H, W] clean future latent
+                frames for anchor injection. Only used in training with
+                stochastic attn configs that have ``future_anchor: True``.
 
         Returns:
             [B, 16, T, H, W] model output
@@ -1739,7 +1826,57 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         ).expand(x.shape[0], -1)
         f, h, w = x.shape[2], x.shape[3], x.shape[4]
         x = x.flatten(2).transpose(1, 2)  # [B, f*h*w, dim]
-        seq_lens = torch.tensor([x.shape[1]] * x.shape[0], dtype=torch.long, device=device)
+        num_main_tokens = x.shape[1]
+
+        # ----- Stochastic attention config sampling -----
+        # Sample early so we know if future anchor is active before building
+        # the block mask and before we need to inject anchor tokens.
+        attn_cfg = None
+        if self.training and self._stochastic_attn_configs:
+            attn_cfg = self._sample_attn_config()
+
+        # ----- Future anchor: select one frame based on sampled config -----
+        future_anchor_latent = None
+        future_anchor_distance = 0
+        if (self.training
+                and future_anchor_latents is not None
+                and attn_cfg is not None
+                and attn_cfg.get("future_anchor", False)):
+            d = attn_cfg["future_anchor_distance"]
+            # future_anchor_latents: [B, 16, N_future, H, W]
+            if d <= future_anchor_latents.shape[2]:
+                future_anchor_latent = future_anchor_latents[:, :, d - 1:d]  # [B, 16, 1, H, W]
+                future_anchor_distance = d
+
+        # ----- Inject future anchor tokens -----
+        num_anchor_tokens = 0
+        anchor_frame_offset = 0
+        if future_anchor_latent is not None:
+            # Build 36ch input matching patch_embedding's expected channels:
+            # [16ch anchor_latent, 4ch mask(ones), 16ch anchor_latent_as_ref]
+            B_a = future_anchor_latent.shape[0]
+            H_a, W_a = future_anchor_latent.shape[3], future_anchor_latent.shape[4]
+            anchor_mask_4ch = torch.ones(
+                B_a, 4, 1, H_a, W_a,
+                device=future_anchor_latent.device,
+                dtype=future_anchor_latent.dtype,
+            )
+            anchor_36ch = torch.cat([
+                future_anchor_latent,   # 16ch: clean future latent
+                anchor_mask_4ch,        # 4ch: fully known frame
+                future_anchor_latent,   # 16ch: self-reference
+            ], dim=1)  # [B, 36, 1, H, W]
+
+            anchor_embedded = self.patch_embedding(anchor_36ch)  # [B, dim, 1, h, w]
+            anchor_tokens = anchor_embedded.flatten(2).transpose(1, 2)  # [B, h*w, dim]
+            num_anchor_tokens = anchor_tokens.shape[1]
+            anchor_frame_offset = f + future_anchor_distance
+
+            x = torch.cat([x, anchor_tokens], dim=1)  # [B, f*h*w + h*w, dim]
+
+        seq_lens = torch.tensor(
+            [x.shape[1]] * x.shape[0], dtype=torch.long, device=device
+        )
 
         # Time embedding -- supports both scalar [B] and per-frame [B, T_latent]
         if timestep.dim() == 2:
@@ -1770,6 +1907,19 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
             # t_emb for head: [B, dim] -> [B, F, dim]
             t_emb = t_emb.unsqueeze(1).expand(-1, f, -1)
 
+        # Extend t_mod and t_emb for the anchor frame (clean, t=0 -> zero)
+        if num_anchor_tokens > 0:
+            anchor_t_mod = torch.zeros(
+                t_mod.shape[0], 1, t_mod.shape[2], t_mod.shape[3],
+                device=t_mod.device, dtype=t_mod.dtype,
+            )
+            t_mod = torch.cat([t_mod, anchor_t_mod], dim=1)  # [B, F+1, 6, dim]
+            anchor_t_emb = torch.zeros(
+                t_emb.shape[0], 1, t_emb.shape[2],
+                device=t_emb.device, dtype=t_emb.dtype,
+            )
+            t_emb = torch.cat([t_emb, anchor_t_emb], dim=1)  # [B, F+1, dim]
+
         assert t_emb.dtype == torch.float32 and t_mod.dtype == torch.float32
 
         # Text embedding
@@ -1795,21 +1945,22 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         audio_embedding = self._process_audio(audio, device, x.dtype) if audio is not None else None
 
         # Build block mask (chunk-wise causal, optionally stochastic)
-        if self.training and self._stochastic_attn_configs:
-            attn_cfg = self._sample_attn_config()
+        frame_seqlen = h * w
+        if attn_cfg is not None:
+            # Stochastic attention config was sampled above
             if FLEX_ATTENTION_AVAILABLE:
-                frame_seqlen = h * w
                 self.block_mask = self._build_block_mask(
                     device, f, frame_seqlen, self.chunk_size,
                     local_attn_size=attn_cfg["local_attn_size"],
                     sink_size=attn_cfg["sink_size"],
+                    num_anchor_tokens=num_anchor_tokens,
                 )
         elif self.block_mask is None and FLEX_ATTENTION_AVAILABLE:
-            frame_seqlen = h * w
             self.block_mask = self._build_block_mask(
                 device, f, frame_seqlen, self.chunk_size,
                 local_attn_size=self.local_attn_size,
                 sink_size=self.sink_size,
+                num_anchor_tokens=num_anchor_tokens,
             )
 
         # Create custom forward for gradient checkpointing
@@ -1827,6 +1978,8 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
             context_lens=context_lens,
             audio_embedding=audio_embedding,
             block_mask=self.block_mask,
+            num_anchor_tokens=num_anchor_tokens,
+            anchor_frame_offset=anchor_frame_offset,
         )
 
         for block_index, block in enumerate(self.blocks):
@@ -1845,8 +1998,14 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
             else:
                 x = block(x, **block_kwargs)
 
-        # Head: t_emb is [B, dim], need [B, F, 1, dim]
-        head_e = t_emb.unsqueeze(2)  # [B, F, 1, dim]
+        # Strip anchor tokens before output projection
+        if num_anchor_tokens > 0:
+            x = x[:, :num_main_tokens]
+
+        # Head: t_emb is [B, F, dim], need [B, F, 1, dim]
+        # Use only the main-frame entries (exclude anchor t_emb)
+        head_t_emb = t_emb[:, :f, :]
+        head_e = head_t_emb.unsqueeze(2)  # [B, F, 1, dim]
         x = self.head(x, head_e)
 
         # Unpatchify
@@ -2160,6 +2319,11 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
         h_patches, w_patches = H // p_h, W // p_w
         current_start = cur_start_frame * h_patches * w_patches
 
+        # Extract future anchor latents from condition (if present)
+        fa_latents = None
+        if isinstance(condition, dict):
+            fa_latents = condition.get("future_anchor_latents")
+
         # Auto-detect inhomogeneous per-frame timesteps -> full-sequence mode
         if timestep.dim() == 2:
             model_output = self._forward_full_sequence(
@@ -2170,6 +2334,7 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
                 y=y,
                 audio=audio_emb,
                 use_gradient_checkpointing=use_gradient_checkpointing,
+                future_anchor_latents=fa_latents,
             )
         elif is_ar:
             model_output = self._forward_ar(
@@ -2192,6 +2357,7 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
                 y=y,
                 audio=audio_emb,
                 use_gradient_checkpointing=use_gradient_checkpointing,
+                future_anchor_latents=fa_latents,
             )
 
         # Convert prediction type

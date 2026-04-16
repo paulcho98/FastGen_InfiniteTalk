@@ -181,6 +181,17 @@ def parse_args():
                    choices=["crop", "pad"],
                    help="Preprocessing for raw/video inputs: 'crop' = resize+center-crop "
                         "(default), 'pad' = resize to short side + zero-pad to target")
+    p.add_argument("--anchor_input_only", action="store_true",
+                   help="Input-anchor frame 0 (model sees clean reference) but disable "
+                        "output anchor (model's raw prediction is preserved). Post-step "
+                        "pin still active so every step sees clean input. Use with "
+                        "--debug_anchor_vis to measure the model's intrinsic frame-0 "
+                        "reproduction ability.")
+    p.add_argument("--debug_anchor_vis", action="store_true",
+                   help="Save per-step diagnostic images of frame-0 latents on the "
+                        "sink chunk (chunk 0). Decodes input/output at each denoising "
+                        "step and the cache-store input to verify anchoring. "
+                        "Adds ~10 VAE decodes per sample.")
 
     args = p.parse_args()
 
@@ -704,7 +715,8 @@ def load_diffusion_model(args, num_latent, device, dtype):
 
 @torch.no_grad()
 def run_inference(model, condition, num_latent_frames, chunk_size,
-                  context_noise, seed, device, dtype, anchor_first_frame=True):
+                  context_noise, seed, device, dtype, anchor_first_frame=True,
+                  anchor_input_only=False, debug_anchor_vis=False):
     """Block-wise autoregressive inference — no CFG, no gradients."""
     B = 1
     C = 16
@@ -731,9 +743,14 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
     # InfiniteTalk inference: multitalk.py line 711 overwrites frame 0 at every step)
     first_frame_latent = condition["first_frame_cond"][:, :, 0:1]  # [B, 16, 1, H, W]
 
+    # Debug: collect frame-0 latent slices for anchor visualization
+    diagnostics = [] if debug_anchor_vis else None
+    ref_flat = first_frame_latent.float().flatten() if debug_anchor_vis else None
+
     print(f"  AR loop: {num_blocks} blocks x {num_denoise_steps} denoising steps "
           f"= {num_blocks * (num_denoise_steps + 1)} forward passes"
-          f"{' (anchor_first_frame=ON)' if anchor_first_frame else ''}")
+          f"{' (anchor_first_frame=ON)' if anchor_first_frame else ''}"
+          f"{' (anchor_input_only=ON)' if anchor_input_only else ''}")
 
     # Read toggles from the model (set in load_diffusion_model)
     import os
@@ -753,7 +770,16 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
         for step_idx in range(num_denoise_steps):
             is_last = (step_idx == last_step_idx)
             store_kv_here = skip_clean_cache and is_last and not f2_active
-            apply_anchor_here = not (f2_active and is_last)
+            apply_anchor_here = anchor_first_frame and not (f2_active and is_last)
+            # anchor_input_only: feed model clean frame 0 (input anchor) but
+            # let the model's output be raw (no output anchor). This isolates
+            # the model's intrinsic frame-0 reproduction ability.
+            if anchor_input_only:
+                apply_output_anchor_here = False
+                apply_input_anchor_here = not (f2_active and is_last)
+            else:
+                apply_output_anchor_here = apply_anchor_here
+                apply_input_anchor_here = apply_anchor_here
 
             if debug_trace:
                 print(f"[sample_loop] chunk_idx={block_idx} start={cur_start_frame} "
@@ -763,6 +789,18 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
             t_cur = t_list_t[step_idx]
             t_next = t_list_t[step_idx + 1]
 
+            # Diagnostic: capture model input frame 0 on chunk 0
+            if diagnostics is not None and cur_start_frame == 0:
+                inp_f0 = noisy_input[:, :, 0:1]
+                l2 = (inp_f0.float().flatten() - ref_flat).norm().item()
+                tag = "_STOREKV" if store_kv_here else ""
+                print(f"    [diag] c0 step {step_idx} input_f0{tag}: "
+                      f"L2_from_ref={l2:.4f}  t={t_cur.item():.3f}")
+                diagnostics.append((
+                    f"c0_s{step_idx}_input_f0{tag}",
+                    inp_f0.cpu().clone(),
+                ))
+
             x0_pred = model(
                 noisy_input,
                 t_cur.expand(B),
@@ -771,16 +809,27 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
                 store_kv=store_kv_here,
                 is_ar=True,
                 fwd_pred_type="x0",
-                apply_anchor=apply_anchor_here,
-                apply_input_anchor=apply_anchor_here,
+                apply_anchor=apply_output_anchor_here,
+                apply_input_anchor=apply_input_anchor_here,
                 use_gradient_checkpointing=False,
             )
 
             # Explicit safety anchor (redundant with forward's builtin). Skip when
             # we're deliberately suppressing anchor via apply_anchor_here.
-            if anchor_first_frame and cur_start_frame == 0 and apply_anchor_here:
+            if anchor_first_frame and not anchor_input_only and cur_start_frame == 0 and apply_anchor_here:
                 x0_pred = x0_pred.clone()
                 x0_pred[:, :, 0:1] = first_frame_latent
+
+            # Diagnostic: capture model output frame 0 on chunk 0
+            if diagnostics is not None and cur_start_frame == 0:
+                out_f0 = x0_pred[:, :, 0:1]
+                l2 = (out_f0.float().flatten() - ref_flat).norm().item()
+                print(f"    [diag] c0 step {step_idx} output_f0: "
+                      f"L2_from_ref={l2:.4f}")
+                diagnostics.append((
+                    f"c0_s{step_idx}_output_f0",
+                    out_f0.cpu().clone(),
+                ))
 
             if t_next > 0:
                 eps = torch.randn_like(x0_pred)
@@ -789,14 +838,14 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
                 )
                 # Post-scheduler-step pin — matches InfiniteTalk's
                 # multitalk.py:773 convention on the production AR path.
-                if cur_start_frame == 0 and isinstance(condition, dict) and "first_frame_cond" in condition:
+                if anchor_first_frame and cur_start_frame == 0 and isinstance(condition, dict) and "first_frame_cond" in condition:
                     noisy_input = noisy_input.clone()
                     noisy_input[:, :, 0:1] = first_frame_latent
             else:
                 noisy_input = x0_pred
 
         # Write displayed output. For F2 on sink chunk, manually anchor frame 0.
-        if f2_active and isinstance(condition, dict) and "first_frame_cond" in condition:
+        if f2_active and anchor_first_frame and isinstance(condition, dict) and "first_frame_cond" in condition:
             x_display = x0_pred.clone()
             x_display[:, :, 0:1] = first_frame_latent
             output[:, :, cur_start_frame:cur_start_frame + chunk_size] = x_display
@@ -805,6 +854,18 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
 
         if do_cache_pass:
             cache_input = x0_pred  # non-anchored when f2_active
+
+            # Diagnostic: capture cache-store input frame 0 on chunk 0
+            if diagnostics is not None and cur_start_frame == 0:
+                ci_f0 = cache_input[:, :, 0:1]
+                l2 = (ci_f0.float().flatten() - ref_flat).norm().item()
+                print(f"    [diag] c0 cache_store_input_f0: "
+                      f"L2_from_ref={l2:.4f}  (feeds store_kv=True fwd)")
+                diagnostics.append((
+                    "c0_cache_store_input_f0",
+                    ci_f0.cpu().clone(),
+                ))
+
             t_cache = torch.full((B,), context_noise, device=device, dtype=dtype)
             if context_noise > 0:
                 cache_eps = torch.randn_like(x0_pred)
@@ -812,11 +873,18 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
                     x0_pred, cache_eps,
                     torch.tensor(context_noise, device=device, dtype=torch.float64).expand(B),
                 )
-            apply_anchor_cache = not f2_active
+            if anchor_input_only:
+                apply_anchor_cache_out = False
+                apply_anchor_cache_in = not f2_active
+            else:
+                apply_anchor_cache_out = anchor_first_frame and not f2_active
+                apply_anchor_cache_in = anchor_first_frame and not f2_active
 
             if debug_trace:
                 print(f"[sample_loop] cache_pass chunk_idx={block_idx} "
-                      f"start={cur_start_frame} store_kv=True apply_anchor={apply_anchor_cache} "
+                      f"start={cur_start_frame} store_kv=True "
+                      f"apply_anchor_out={apply_anchor_cache_out} "
+                      f"apply_anchor_in={apply_anchor_cache_in} "
                       f"f2_active={f2_active}")
 
             model(
@@ -827,16 +895,20 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
                 store_kv=True,
                 is_ar=True,
                 fwd_pred_type="x0",
-                apply_anchor=apply_anchor_cache,
-                apply_input_anchor=apply_anchor_cache,
+                apply_anchor=apply_anchor_cache_out,
+                apply_input_anchor=apply_anchor_cache_in,
                 use_gradient_checkpointing=False,
             )
+
+        if diagnostics is not None and cur_start_frame == 0 and not do_cache_pass:
+            print(f"    [diag] c0: F3 on — no separate cache pass; "
+                  f"KV stored on exit step (see _STOREKV entry above)")
 
         print(f"    Block {block_idx + 1}/{num_blocks} done "
               f"(frames {cur_start_frame}-{cur_start_frame + chunk_size - 1})")
 
     model.clear_caches()
-    return output
+    return output, diagnostics
 
 
 # ===========================================================================
@@ -898,6 +970,64 @@ def decode_and_save(vae, output_latents, audio_path, output_path, fps, device):
         print(f"  No audio to mux. Output: {output_path}")
 
     return output_path
+
+
+@torch.no_grad()
+def decode_latent_frame(vae, latent_frame, device):
+    """Decode a single-frame latent [16, 1, H, W] -> numpy [H, W, 3] uint8."""
+    vae.model = vae.model.to(device)
+    vae.mean = vae.mean.to(device)
+    vae.std = vae.std.to(device)
+    vae.scale = [vae.mean, 1.0 / vae.std]
+    latent = latent_frame.to(device=device, dtype=torch.float32)
+    video_tensor = vae.decode([latent])
+    if isinstance(video_tensor, (list, tuple)):
+        video_tensor = video_tensor[0]
+    if video_tensor.dim() == 5:
+        video_tensor = video_tensor[0]
+    # video_tensor: [C, T, H, W] — take first (only) frame
+    frame = (video_tensor[:, 0].clamp(-1, 1) + 1) / 2 * 255
+    frame = frame.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+    return frame
+
+
+@torch.no_grad()
+def save_anchor_diagnostics(diagnostics, ref_latent, vae, output_dir, device):
+    """Decode diagnostic latent slices and save as PNGs with L2 summary.
+
+    Args:
+        diagnostics: list of (label, latent [1, 16, 1, H, W])
+        ref_latent: clean reference latent [1, 16, 1, H, W]
+        vae: WanVAE instance
+        output_dir: directory to write PNGs + summary.txt
+        device: CUDA device for VAE decode
+    """
+    from PIL import Image as PILImage
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Decode reference
+    ref_frame = decode_latent_frame(vae, ref_latent[0], device)
+    PILImage.fromarray(ref_frame).save(os.path.join(output_dir, "00_ref_clean_f0.png"))
+
+    ref_flat = ref_latent.float().flatten()
+    summary = [
+        "Anchor Diagnostics — Frame 0 of Sink Chunk (Chunk 0)",
+        "=" * 55,
+        "00_ref_clean_f0.png  (clean first_frame_cond reference)",
+    ]
+
+    for i, (label, latent) in enumerate(diagnostics):
+        frame = decode_latent_frame(vae, latent[0], device)
+        fname = f"{i + 1:02d}_{label}.png"
+        PILImage.fromarray(frame).save(os.path.join(output_dir, fname))
+        l2 = (latent.float().flatten() - ref_flat).norm().item()
+        summary.append(f"{fname}  L2_from_ref={l2:.6f}")
+
+    summary_path = os.path.join(output_dir, "summary.txt")
+    with open(summary_path, "w") as f:
+        f.write("\n".join(summary) + "\n")
+
+    print(f"  Anchor diagnostics: {len(diagnostics) + 1} images -> {output_dir}")
 
 
 # ===========================================================================
@@ -1154,16 +1284,28 @@ def main():
             tag = mode_name if mode_name else ("anchor" if anchor else "no_anchor")
             print(f"  Running AR inference ({num_latent} latent / {num_video} video frames) "
                   f"[mode={tag}, anchor={anchor}]...")
-            output_latents = run_inference(
+            output_latents, anchor_diag = run_inference(
                 model, condition, num_latent, args.chunk_size,
                 args.context_noise, args.seed + sample_idx, device, dtype,
                 anchor_first_frame=anchor,
+                anchor_input_only=args.anchor_input_only,
+                debug_anchor_vis=args.debug_anchor_vis,
             )
 
             # Decode and save
             print(f"  Decoding and saving [{tag}]...")
             decode_and_save(vae, output_latents, audio_path, out_path, args.fps, device)
             print(f"  Output: {out_path}")
+
+            # Save anchor diagnostics if requested
+            if anchor_diag is not None:
+                ref_latent = condition["first_frame_cond"][:, :, 0:1].cpu()
+                diag_dir = os.path.join(
+                    os.path.dirname(os.path.abspath(out_path)),
+                    "debug_vis",
+                    os.path.splitext(os.path.basename(out_path))[0],
+                )
+                save_anchor_diagnostics(anchor_diag, ref_latent, vae, diag_dir, device)
 
             del output_latents
             torch.cuda.empty_cache()
