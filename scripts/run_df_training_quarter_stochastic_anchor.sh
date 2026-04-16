@@ -52,6 +52,7 @@ ACCUM=$((32 / (4 * NUM_GPUS)))
 echo "Batch size:     4/GPU (measured: 67.9GB peak on A100-80GB)"
 echo "Effective BS:   32 (BS=4 x accum=${ACCUM} x ${NUM_GPUS}gpu)"
 echo "Max iters:      10,000"
+echo "Input anchoring: ON  (clean frame-0 pinned on every forward — new vs prior DF runs)"
 echo "Stochastic attn: 10 configs (5 baseline + 5 future anchor)"
 echo "Future anchor:  50% of configs, distance [1,5] or [1,3]"
 echo "Train list:     $INFINITETALK_TRAIN_LIST ($(wc -l < $INFINITETALK_TRAIN_LIST) samples)"
