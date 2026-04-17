@@ -315,3 +315,23 @@ def test_rollout_kf_extends_noise_by_k():
     """KF rollout internally extends noise by k extra frames for the last chunk's knot."""
     import pytest
     pytest.skip("Integration test — covered by valtest in KF-20")
+
+
+def test_maybe_pad_audio_for_knot_no_op():
+    """extra=0 is a no-op."""
+    from fastgen.datasets.infinitetalk_dataloader import _maybe_pad_audio_for_knot
+    audio = torch.arange(21 * 12 * 768, dtype=torch.float32).reshape(21, 12, 768)
+    out = _maybe_pad_audio_for_knot(audio, extra=0)
+    assert out.shape == audio.shape
+    assert torch.allclose(out, audio)
+
+
+def test_maybe_pad_audio_for_knot_extends_repeat_last():
+    """extra>0 extends by repeating the last slice."""
+    from fastgen.datasets.infinitetalk_dataloader import _maybe_pad_audio_for_knot
+    audio = torch.arange(21 * 12 * 768, dtype=torch.float32).reshape(21, 12, 768)
+    out = _maybe_pad_audio_for_knot(audio, extra=4)
+    assert out.shape == (25, 12, 768)
+    assert torch.allclose(out[:21], audio)
+    assert torch.allclose(out[21], audio[20])
+    assert torch.allclose(out[24], audio[20])

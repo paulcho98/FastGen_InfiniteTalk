@@ -75,6 +75,21 @@ def _maybe_swap_last_frame_ref(first_frame_cond: torch.Tensor,
     return out
 
 
+def _maybe_pad_audio_for_knot(audio_emb: torch.Tensor, extra: int) -> torch.Tensor:
+    """Right-pad audio_emb by `extra` slices (repeat last). No-op when extra <= 0.
+
+    Paper Section 3.2 (Knot Forcing): each chunk denoises c+k frames; the last
+    chunk needs k extra latent frames of audio-emb context. For our setup, one
+    latent frame ≈ 4 video pixel frames. When the precomputed audio_emb is
+    exactly `_train_pixel_frames` long, we pad by `extra` slices (repeat last).
+    """
+    if extra <= 0:
+        return audio_emb
+    last = audio_emb[-1:]
+    pad = last.repeat(extra, *([1] * (audio_emb.dim() - 1)))
+    return torch.cat([audio_emb, pad], dim=0)
+
+
 # Aspect-ratio buckets for 480p (627-class) — matches InfiniteTalk's original pipeline
 ASPECT_RATIO_627 = {
     '0.26': [320, 1216], '0.38': [384, 1024], '0.50': [448, 896],
@@ -510,6 +525,7 @@ class InfiniteTalkDataset(Dataset):
         wav2vec_dir: str = None,
         encode_device: str = "cuda:0",
         use_last_frame_reference: bool = False,
+        knot_size_extra_audio_pixel: int = 0,
     ):
         """
         Args:
@@ -550,6 +566,7 @@ class InfiniteTalkDataset(Dataset):
         self._vae_suffix = "_quarter" if quarter_res else ""
         self.audio_data_root = audio_data_root
         self.use_last_frame_reference = use_last_frame_reference
+        self.knot_size_extra_audio_pixel = knot_size_extra_audio_pixel
         self._lazy_enabled = False
 
         # --- Lazy caching setup ---
@@ -1158,7 +1175,16 @@ class InfiniteTalkDataset(Dataset):
             f"audio_emb has {audio_emb.shape[0]} frames, need >= {self._train_pixel_frames}. "
             f"Sample: {sample_dir}"
         )
-        audio_emb = audio_emb[:self._train_pixel_frames]  # [train_pixel_frames, 12, 768]
+        # KF: extend slice to train_pixel_frames + knot_size_extra_audio_pixel if
+        # disk has enough; else slice to disk-available length and right-pad by
+        # repeating the last slice to hit the target.
+        extra_k_pixel = getattr(self, "knot_size_extra_audio_pixel", 0)
+        target_len = self._train_pixel_frames + extra_k_pixel
+        if audio_emb.shape[0] >= target_len:
+            audio_emb = audio_emb[:target_len]  # [target_len, 12, 768]
+        else:
+            audio_emb = audio_emb[:self._train_pixel_frames]  # cap to available
+            audio_emb = _maybe_pad_audio_for_knot(audio_emb, target_len - audio_emb.shape[0])
         audio_emb = audio_emb.to(torch.bfloat16)
 
         # --- Text embeddings ---
