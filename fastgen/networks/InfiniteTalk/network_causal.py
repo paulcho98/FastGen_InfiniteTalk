@@ -250,6 +250,7 @@ def _apply_window_rope(
     *,
     lookahead_sink_enabled: bool,
     lookahead_distance: int,
+    running_ahead_n: Optional[int] = None,
     use_dynamic_rope: bool,
     static_roped_q: Optional[torch.Tensor] = None,
     static_k_win: Optional[torch.Tensor] = None,
@@ -285,21 +286,29 @@ def _apply_window_rope(
     # cached content in k_win). On chunk 0, k_win is just the current chunk,
     # so sink_tokens may be < k_win.shape[1] but there's no actual cached
     # sink slab to shift — we must not fire lookahead in that case.
-    use_lookahead = (
-        lookahead_sink_enabled
-        and sink_tokens > 0
+    # Gating conditions identical for F1 and running-ahead:
+    # sink must exist in the k_win (cached slab) distinct from the current chunk.
+    sink_gate_ok = (
+        sink_tokens > 0
         and sink_tokens < k_win.shape[1]
         and query_offset_in_win > 0
     )
+    use_running_ahead = running_ahead_n is not None and sink_gate_ok
+    use_lookahead = lookahead_sink_enabled and sink_gate_ok and not use_running_ahead
+    use_custom_sink_pos = use_running_ahead or use_lookahead
 
-    if use_lookahead:
+    if use_custom_sink_pos:
         sink_frames_n = sink_tokens // frame_seqlen
         rest_frames_n = F_window - sink_frames_n
-        sink_pos = F_window - 1 + lookahead_distance
+        if use_running_ahead:
+            sink_pos = int(running_ahead_n)
+        else:
+            sink_pos = F_window - 1 + lookahead_distance
 
         if os.environ.get("LOOKAHEAD_DEBUG_TRACE") == "1":
+            source = "running_ahead" if use_running_ahead else "lookahead"
             logger.info(
-                f"[lookahead] use_lookahead=True F_window={F_window} "
+                f"[sink_rope source={source}] F_window={F_window} "
                 f"sink_tokens={sink_tokens} sink_frames_n={sink_frames_n} "
                 f"rest_frames_n={rest_frames_n} sink_pos={sink_pos} "
                 f"rest_start=1 q_start={query_offset_in_win // frame_seqlen}"
@@ -682,6 +691,10 @@ class CausalSelfAttention(nn.Module):
                 query_offset_in_win = new_local_start - k_win_start
 
             # -- 6. Apply RoPE (mode-dependent, sink-aware) --
+            running_ahead_n = (
+                int(getattr(self, "_running_ahead_n", 0))
+                if getattr(self, "_running_ahead_enabled", False) else None
+            )
             roped_query, roped_key = _apply_window_rope(
                 q=q,
                 k_win=k_win,
@@ -692,6 +705,7 @@ class CausalSelfAttention(nn.Module):
                 query_offset_in_win=query_offset_in_win,
                 lookahead_sink_enabled=self.lookahead_sink_enabled,
                 lookahead_distance=self.lookahead_distance,
+                running_ahead_n=running_ahead_n,
                 use_dynamic_rope=self.use_dynamic_rope,
                 static_roped_q=(roped_q if not self.use_dynamic_rope else None),
                 static_k_win=(k_win if not self.use_dynamic_rope else None),
@@ -1152,6 +1166,23 @@ def _maybe_apply_input_anchor(
     x_t = x_t.clone()
     x_t[:, :, 0:1] = first_frame_cond[:, :, 0:1]
     return x_t
+
+
+def compute_sink_rope_position(net_module, F_window: int) -> int:
+    """Compute the RoPE position to use for the sink's K rotation.
+
+    Precedence (enforced mutually-exclusive by config validation):
+      - running_ahead enabled → absolute position from _running_ahead_n
+        (Knot Forcing, Algorithm 1, Section 3.3 of paper).
+      - lookahead_sink (F1) enabled → F_window - 1 + lookahead_distance
+        (our pre-KF lookahead, fixed relative offset).
+      - neither → natural position 0 (standard causal sink at frame 0).
+    """
+    if getattr(net_module, "_running_ahead_enabled", False):
+        return int(net_module._running_ahead_n)
+    if getattr(net_module, "lookahead_sink_enabled", False):
+        return int(F_window - 1 + net_module.lookahead_distance)
+    return 0
 
 
 def advance_running_ahead(net_module, i: int, c: int, k: int) -> tuple:

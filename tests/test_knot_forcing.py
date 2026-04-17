@@ -163,3 +163,47 @@ def test_advance_running_ahead_multiple_fires():
     advanced3, new_n3 = advance_running_ahead(net, i=12, c=3, k=1)
     assert advanced3 is False
     assert new_n3 == 16
+
+
+def test_compute_sink_rope_position_running_ahead_wins():
+    """Running-ahead takes precedence over F1 and natural."""
+    from fastgen.networks.InfiniteTalk.network_causal import compute_sink_rope_position
+
+    class NetRA:
+        _running_ahead_enabled = True
+        _running_ahead_n = 8
+        lookahead_sink_enabled = False
+        lookahead_distance = 0
+    assert compute_sink_rope_position(NetRA(), F_window=10) == 8
+
+
+def test_compute_sink_rope_position_f1_when_no_running_ahead():
+    from fastgen.networks.InfiniteTalk.network_causal import compute_sink_rope_position
+
+    class NetF1:
+        _running_ahead_enabled = False
+        _running_ahead_n = 0
+        lookahead_sink_enabled = True
+        lookahead_distance = 4
+    # F_window - 1 + lookahead_distance = 10 - 1 + 4 = 13
+    assert compute_sink_rope_position(NetF1(), F_window=10) == 13
+
+
+def test_compute_sink_rope_position_natural_when_neither():
+    from fastgen.networks.InfiniteTalk.network_causal import compute_sink_rope_position
+
+    class NetNeither:
+        _running_ahead_enabled = False
+        _running_ahead_n = 0
+        lookahead_sink_enabled = False
+        lookahead_distance = 0
+    assert compute_sink_rope_position(NetNeither(), F_window=10) == 0
+
+
+def test_compute_sink_rope_position_missing_attrs_default_natural():
+    """Module with no running_ahead/F1 attrs → natural position 0."""
+    from fastgen.networks.InfiniteTalk.network_causal import compute_sink_rope_position
+
+    class Bare:
+        pass
+    assert compute_sink_rope_position(Bare(), F_window=10) == 0

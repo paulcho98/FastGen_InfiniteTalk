@@ -189,8 +189,8 @@ def test_static_rope_mode_returns_prerotated():
 
 
 def test_debug_trace_logs_when_env_var_set(monkeypatch):
-    """When LOOKAHEAD_DEBUG_TRACE=1, a [lookahead] line is logged via the
-    fastgen logger (loguru).
+    """When LOOKAHEAD_DEBUG_TRACE=1, a [sink_rope source=lookahead] line is
+    logged via the fastgen logger (loguru).
 
     Injects a temporary loguru sink to intercept messages since loguru's
     sys.stdout sink was bound at import time and bypasses capsys/capfd.
@@ -225,11 +225,13 @@ def test_debug_trace_logs_when_env_var_set(monkeypatch):
         loguru_logger.remove(sink_id)
 
     combined = "".join(str(m) for m in messages)
-    assert "[lookahead]" in combined, f"Expected [lookahead] trace. Captured: {combined!r}"
+    assert "[sink_rope source=lookahead]" in combined, (
+        f"Expected [sink_rope source=lookahead] trace. Captured: {combined!r}"
+    )
 
 
 def test_debug_trace_silent_when_env_var_unset(monkeypatch):
-    """When LOOKAHEAD_DEBUG_TRACE is unset, no [lookahead] line is printed."""
+    """When LOOKAHEAD_DEBUG_TRACE is unset, no [sink_rope] line is printed."""
     from loguru import logger as loguru_logger
     import fastgen.networks.InfiniteTalk.network_causal as ncm
     from fastgen.networks.InfiniteTalk.network_causal import _apply_window_rope
@@ -259,7 +261,7 @@ def test_debug_trace_silent_when_env_var_unset(monkeypatch):
         loguru_logger.remove(sink_id)
 
     combined = "".join(str(m) for m in messages)
-    assert "[lookahead]" not in combined, f"Expected no [lookahead] trace. Captured: {combined!r}"
+    assert "[sink_rope" not in combined, f"Expected no [sink_rope] trace. Captured: {combined!r}"
 
 
 def test_lookahead_does_not_fire_on_chunk_zero():
