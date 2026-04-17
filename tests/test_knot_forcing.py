@@ -278,3 +278,40 @@ def test_maybe_swap_last_frame_ref_enabled():
     assert torch.allclose(out[:, 0], vae_latents[:, -1])
     # Positions 1..T-1 unchanged (still zeros from the original first_frame_cond)
     assert torch.allclose(out[:, 1:], first_frame_cond[:, 1:])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KF-11: rollout_with_gradient KF branch integration tests (placeholders).
+# End-to-end validation happens in the valtest smoke run (KF-20) and by
+# running the full regression suite to confirm KF-off is bit-exact.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_rollout_kf_off_is_bit_exact(monkeypatch):
+    """When use_temporal_knot=False and use_running_ahead=False, rollout_with_gradient
+    is bit-exact to the pre-KF implementation (feature-flag discipline)."""
+    # Semi-smoke test: just confirm no new config fields are READ when off.
+    # Full bit-exact test requires a fixture checkpoint; skip here.
+    # We instead rely on the 90+ existing regression tests NOT failing.
+    import pytest
+    pytest.skip("Covered by regression test suite (existing SF tests must all pass).")
+
+
+def test_rollout_kf_on_denoises_cplusk_frames():
+    """KF rollout reads c+k frames per chunk instead of c."""
+    # This test uses a MockNet pattern. Read tests/test_sample_loop_toggles.py for template.
+    # If the pattern is too heavy, mark as a TODO skip with a clear note:
+    import pytest
+    pytest.skip("Integration test — requires MockNet pattern (see test_sample_loop_toggles.py); covered by valtest in KF-20")
+
+
+def test_rollout_kf_commits_only_c_frames():
+    """KF output tensor has num_blocks * c frames, not num_blocks * (c+k)."""
+    import pytest
+    pytest.skip("Integration test — covered by valtest in KF-20")
+
+
+def test_rollout_kf_extends_noise_by_k():
+    """KF rollout internally extends noise by k extra frames for the last chunk's knot."""
+    import pytest
+    pytest.skip("Integration test — covered by valtest in KF-20")

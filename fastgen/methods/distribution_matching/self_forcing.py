@@ -101,19 +101,36 @@ class SelfForcingModel(CausVidModel):
         No external KV cache is used. Instead, we update the model's internal caches
         once per completed block using `store_kv=True` under no_grad.
 
+        Knot Forcing (paper arXiv:2512.21734v2): when `use_temporal_knot=True` in config:
+          - Each chunk denoises c+k frames (was: c).
+          - For block_idx > 0: inject previous chunk's tail prediction as I2V
+            conditioning at position 0 of the current chunk via
+            `condition["knot_latent_for_chunk_start"]`; pin `noisy_input[:, :, 0:k]`
+            to the knot so the model sees it as clean input.
+          - At exit step: fuse `x0_pred[:, :, 0:k]` with the saved knot via Eq. 5
+            averaging; then save the new knot from `x0_pred[:, :, c:c+k]`.
+          - Commit only first c frames to the output tensor. The knot is held
+            for the next iteration's fusion; it is NOT written to the KV cache.
+          - F3 is forced OFF under KF (separate cache pass used).
+
+        Running-ahead: when `_running_ahead_enabled` on self.net, the sink's RoPE
+        position is advanced by advance_running_ahead when the rollout cursor
+        catches up. Re-caching is implicit under dynamic RoPE.
+
         Args:
-            noise: Initial noise tensor [B, C, T, H, W]
-            condition: Conditioning (dict with 'text_embeds'/'prompt_embeds' or a tensor)
+            noise: Initial noise tensor [B, C, T, H, W]. Under KF, internally
+                extended by k extra frames for the last chunk's knot slot.
+            condition: Conditioning dict.
             enable_gradient: Whether to enable gradients at the exit step
             start_gradient_frame: Frame index to start gradient tracking
 
         Returns:
-            generated_frames: Generated video frames, same shape as noise [B, C, T, H, W]
+            generated_frames: [B, C, num_blocks * c, H, W] (KF commits c frames/block).
+                When KF is off, same as input noise shape (legacy behavior).
         """
         assert isinstance(self.net, CausalFastGenNetwork), f"{self.net} must be a CausalFastGenNetwork"
         self.net.clear_caches()
 
-        # Reset peak memory stats for per-rollout VRAM monitoring
         torch.cuda.empty_cache()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats(device=self.device)
@@ -125,19 +142,29 @@ class SelfForcingModel(CausVidModel):
         sample_steps = self.config.student_sample_steps
         dtype = noise.dtype
 
-        # F3 (skip_clean_cache_pass): when enabled, the exit step stores KV
-        # directly (store_kv=True) and the separate clean-latent cache pass at
-        # t=0 (or context_noise) is skipped. Default False → unchanged behavior.
-        # F2 is NOT plumbed here — sink K/V always comes from the anchor-pinned
-        # input at the exit step, which (with apply_input_anchor=True default)
-        # is the clean first-frame latent.
-        skip_clean_cache = getattr(self.net, "_skip_clean_cache_pass", False)
+        # ── KF flags ──
+        use_knot = getattr(self.config, "use_temporal_knot", False)
+        k = int(getattr(self.config, "knot_size", 1)) if use_knot else 0
+        denoise_len = chunk_size + k  # c+k frames per chunk under KF, c otherwise
 
-        # Sample denoising end steps
+        # Under KF, the last chunk needs k extra noise frames beyond num_blocks*c.
+        # Allocate fresh noise and append. Total: num_blocks * c + k frames.
+        if use_knot:
+            extra = torch.randn(
+                batch_size, C, k, H, W,
+                device=noise.device, dtype=noise.dtype,
+            )
+            noise = torch.cat([noise, extra], dim=2)
+
+        # F3 forced OFF under KF — always use the separate cache pass so the KV
+        # cache is populated with committed c frames only (not c+k).
+        skip_clean_cache = (
+            getattr(self.net, "_skip_clean_cache_pass", False) and not use_knot
+        )
+
         denoising_end_steps = self._sample_denoising_end_steps(num_blocks)
         logger.debug(f"denoising_end_steps: {denoising_end_steps}")
 
-        # t_list
         t_list = self.config.sample_t_cfg.t_list
         if t_list is None:
             t_list = self.net.noise_scheduler.get_t_list(sample_steps, device=self.device)
@@ -147,20 +174,38 @@ class SelfForcingModel(CausVidModel):
             ), f"t_list length (excluding zero) != student_sample_steps: {len(t_list) - 1} != {sample_steps}"
             t_list = torch.tensor(t_list, device=self.device, dtype=self.net.noise_scheduler.t_precision)
 
-        # Collect denoised blocks and concatenate to preserve autograd graph
+        # ── KF state ──
+        knot_latent = None  # x̄ buffer — populated at iter 0 exit step, used at iter 1+
+
+        # Lazy import to avoid circular dep at module load.
+        from fastgen.networks.InfiniteTalk.network_causal import advance_running_ahead
+
         denoised_blocks = []
         for block_idx in range(num_blocks):
             if num_blocks == 0:
-                # Handle case where num_frames < chunk_size
                 cur_start_frame, cur_end_frame = 0, remaining_size
             else:
-                # Normal chunking logic
                 cur_start_frame = 0 if block_idx == 0 else chunk_size * block_idx + remaining_size
-                cur_end_frame = chunk_size * (block_idx + 1) + remaining_size
+                cur_end_frame = cur_start_frame + denoise_len
+
+            # Running-ahead: advance absolute RoPE n when rollout catches up.
+            # Re-cache is implicit under dynamic RoPE (K stored un-rotated,
+            # rotation applied at each attention read).
+            if getattr(self.net, "_running_ahead_enabled", False):
+                advance_running_ahead(self.net, i=cur_start_frame, c=chunk_size, k=k)
 
             noisy_input = noise[:, :, cur_start_frame:cur_end_frame]
 
-            # Denoising steps for current block
+            # KF iter > 0: build condition with knot key + pin noisy_input at pos 0
+            if use_knot and block_idx > 0 and knot_latent is not None:
+                chunk_condition = dict(condition)
+                chunk_condition["knot_latent_for_chunk_start"] = knot_latent
+                # Pin position 0 of noisy_input to the clean knot (model sees clean input)
+                noisy_input = noisy_input.clone()
+                noisy_input[:, :, 0:k] = knot_latent
+            else:
+                chunk_condition = condition
+
             for step, t_cur in enumerate(t_list):
                 if self.config.same_step_across_blocks:
                     exit_flag = step == denoising_end_steps[0]
@@ -170,12 +215,11 @@ class SelfForcingModel(CausVidModel):
                 t_chunk_cur = t_cur.expand(batch_size)
 
                 if not exit_flag:
-                    # Non-exit steps: no grads, no cache updates
                     with torch.no_grad():
                         x0_pred_chunk = self.net(
                             noisy_input,
                             t_chunk_cur,
-                            condition=condition,
+                            condition=chunk_condition,
                             cache_tag="pos",
                             store_kv=False,
                             cur_start_frame=cur_start_frame,
@@ -183,58 +227,87 @@ class SelfForcingModel(CausVidModel):
                             is_ar=True,
                         )
 
-                    # update to the next timestep for forward process
                     t_next = t_list[step + 1]
                     t_chunk_next = t_next.expand(batch_size)
                     if self.config.student_sample_type == "sde":
                         eps_infer = torch.randn_like(x0_pred_chunk)
                     elif self.config.student_sample_type == "ode":
-                        eps_infer = self.net.noise_scheduler.x0_to_eps(xt=noisy_input, x0=x0_pred_chunk, t=t_chunk_cur)
+                        eps_infer = self.net.noise_scheduler.x0_to_eps(
+                            xt=noisy_input, x0=x0_pred_chunk, t=t_chunk_cur
+                        )
                     else:
                         raise NotImplementedError(
                             f"student_sample_type must be one of 'sde', 'ode' but got {self.config.student_sample_type}"
                         )
-                    noisy_input = self.net.noise_scheduler.forward_process(x0_pred_chunk, eps_infer, t_chunk_next)
+                    noisy_input = self.net.noise_scheduler.forward_process(
+                        x0_pred_chunk, eps_infer, t_chunk_next
+                    )
+
+                    # KF iter > 0: re-pin the knot after forward_process (so next step
+                    # still sees clean knot at position 0 of noisy_input)
+                    if use_knot and block_idx > 0 and knot_latent is not None:
+                        noisy_input = noisy_input.clone()
+                        noisy_input[:, :, 0:k] = knot_latent
                 else:
-                    # Exit step: allow gradient if enabled.
-                    # Under F3 (skip_clean_cache=True), this forward ALSO stores
-                    # KV — replacing the separate clean-cache pass below.
                     enable_grad = (
-                        enable_gradient and torch.is_grad_enabled() and (cur_start_frame >= start_gradient_frame)
+                        enable_gradient
+                        and torch.is_grad_enabled()
+                        and (cur_start_frame >= start_gradient_frame)
                     )
                     with torch.set_grad_enabled(enable_grad):
                         x0_pred_chunk = self.net(
                             noisy_input,
                             t_chunk_cur,
-                            condition=condition,
+                            condition=chunk_condition,
                             cache_tag="pos",
                             store_kv=skip_clean_cache,
                             cur_start_frame=cur_start_frame,
                             fwd_pred_type="x0",
                             is_ar=True,
                         )
+
+                    # KF: fusion at exit step + save new knot
+                    if use_knot:
+                        if block_idx > 0 and knot_latent is not None:
+                            # Eq. 5: average previous chunk's knot prediction with
+                            # current chunk's prediction at the shared boundary.
+                            x0_pred_chunk = x0_pred_chunk.clone()
+                            x0_pred_chunk[:, :, 0:k] = (
+                                knot_latent + x0_pred_chunk[:, :, 0:k]
+                            ) / 2.0
+                        # Save new knot from the last k frames of the c+k prediction.
+                        # Kept gradient-enabled so future-chunk fusion can backprop.
+                        knot_latent = x0_pred_chunk[:, :, chunk_size:chunk_size + k]
+
                     break
 
-            # Save denoised block; keep autograd path by collecting and concatenating later
-            denoised_blocks.append(x0_pred_chunk)
+            # Commit: under KF, only first c frames go to output; knot is held
+            if use_knot:
+                committed = x0_pred_chunk[:, :, 0:chunk_size]
+            else:
+                committed = x0_pred_chunk
+            denoised_blocks.append(committed)
 
-            # Update internal KV cache for this finished block using t=0 or context noise
-            # (no grads). Skipped when F3 is active — the exit step above already did it.
+            # KV cache update: always separate pass under KF (F3 forced off for KF).
+            # Caches only committed c frames, not the knot.
             if not skip_clean_cache:
                 with torch.no_grad():
                     if self.config.context_noise > 0:
-                        # Add context noise to denoised frames before caching
-                        t_cache = torch.full((batch_size,), self.config.context_noise, device=self.device, dtype=dtype)
+                        t_cache = torch.full(
+                            (batch_size,), self.config.context_noise,
+                            device=self.device, dtype=dtype,
+                        )
                         x0_pred_cache = self.net.noise_scheduler.forward_process(
-                            x0_pred_chunk,
-                            torch.randn_like(x0_pred_chunk),
+                            committed,
+                            torch.randn_like(committed),
                             t_cache,
                         )
                     else:
-                        x0_pred_cache = x0_pred_chunk
+                        x0_pred_cache = committed
                         t_cache = torch.zeros(batch_size, device=self.device, dtype=dtype)
 
-                    # update kv-cache with generated frames
+                    # Cache pass uses the BASE condition (no knot key) — we're
+                    # caching the committed clean frames, not the knot.
                     _ = self.net(
                         x0_pred_cache,
                         t_cache,
@@ -246,7 +319,6 @@ class SelfForcingModel(CausVidModel):
                         is_ar=True,
                     )
 
-        # Concatenate blocks along the temporal dimension to form full output with gradients
         output = torch.cat(denoised_blocks, dim=2) if len(denoised_blocks) > 0 else torch.empty_like(noise)
 
         self.net.clear_caches()
