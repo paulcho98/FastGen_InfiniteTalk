@@ -179,9 +179,19 @@ git commit -m "feat(kf): config validator for incompatible KF/F1 flag combos"
 
 ---
 
-## Phase 2 — Network pin-source override (anchor helpers)
+## Phase 2 — Network knot injection (simplified after code review)
 
-### Task 3: Generalize `_maybe_apply_input_anchor` to accept arbitrary pin source
+**Key insight from code review**: the existing `_maybe_apply_input_anchor` and `_maybe_apply_first_frame_anchor` helpers in `network_causal.py` already early-return when `cur_start_frame != 0`. Since KF chunks iter > 0 have `cur_start_frame > 0`, these anchors are automatic no-ops for knot chunks — no modification needed.
+
+**Strategy**: Pin the input directly in the rollout code (`noisy_input[:, :, 0:1] = knot_latent`). Inject the knot into the y-tensor via `_build_y` (see Task 5). Output anchor needs no change — it already skips for iter > 0 due to the `cur_start_frame != 0` gate.
+
+**Tasks 3 and 4 in the original plan are DROPPED** — they described pin-source overrides on anchor helpers that aren't needed. Left these task IDs reserved for renumbering stability; actual work starts at Task 5.
+
+### Task 3: (DROPPED — anchor helpers already handle iter > 0 correctly)
+
+### Task 4: (DROPPED — see Task 3 note)
+
+### Task 3 (OLD): Generalize `_maybe_apply_input_anchor` to accept arbitrary pin source
 
 Currently the helper reads `condition["first_frame_cond"]` as the pin source. Under KF, we need to pin to the knot (`x̄`) at iter > 0.
 
@@ -354,104 +364,125 @@ git commit -m "feat(kf): output anchor accepts pin source override + disable-for
 
 ## Phase 3 — Y-tensor knot injection
 
-### Task 5: Build-y helper that injects VAE(knot) at position 0
+### Task 5: Modify `_build_y` to inject knot at cur_start_frame
 
-The `_build_y()` method constructs the 20-channel y-tensor (4 mask + 16 VAE). Under KF iter > 0, positions 0's VAE channels should carry VAE(knot) instead of VAE(reference).
+**Problem**: existing `_build_y` slices `y_full[:, :, start_frame:start_frame+T]`, so at iter > 0 position 0 of the sliced y has:
+- mask=0 (since mask is only 1 at y_full[:, :, 0])
+- VAE channels = zeros (since first_frame_cond is zero-padded past position 0)
+
+For KF iter > 0, we want position 0 of the sliced y to have mask=1 + VAE=knot.
+
+**Fix**: add a conditional knot injection to `_build_y` that, when `condition["knot_latent_for_chunk_start"]` is present and `start_frame > 0`, modifies the slice to have mask=1 + VAE=knot at position 0.
 
 **Files:**
-- Modify: `fastgen/networks/InfiniteTalk/network_causal.py`
+- Modify: `fastgen/networks/InfiniteTalk/network_causal.py` (inside `CausalInfiniteTalkWan._build_y`)
 - Test: `tests/test_knot_forcing.py`
 
 - [ ] **Step 1: Write failing test**
 
-Append:
+Append to `tests/test_knot_forcing.py`:
 
 ```python
-def test_y_tensor_knot_injection():
-    """When condition['y_position_0_override'] is set, position 0 of y's VAE
-    channels = override, not first_frame_cond."""
+def test_build_y_knot_injection():
+    """At iter > 0, _build_y should inject knot at slice position 0 (absolute start_frame)
+    when condition has 'knot_latent_for_chunk_start'."""
     from fastgen.networks.InfiniteTalk.network_causal import CausalInfiniteTalkWan
-    # We need a build_y method; use the existing one with knot override.
-    # This test only checks the math; no network instantiation needed.
-    # Use a small standalone helper added to the module:
-    from fastgen.networks.InfiniteTalk.network_causal import _build_y_with_knot
+    # Create a minimal stub that only exposes _build_y (bypassing __init__).
+    # _build_y is essentially stateless — it only needs _construct_i2v_mask.
+    stub = CausalInfiniteTalkWan.__new__(CausalInfiniteTalkWan)
     
-    B, C, T, H, W = 1, 16, 4, 8, 8
-    first_frame_cond = torch.ones(B, C, T, H, W) * 7.0
-    knot = torch.ones(B, C, 1, H, W) * -3.0
+    B, C, T_full, H, W = 1, 16, 21, 4, 4
+    ffc = torch.zeros(B, C, T_full, H, W)
+    ffc[:, :, 0] = 7.0  # reference at position 0
+    knot = torch.full((B, C, 1, H, W), -3.0)
     
-    # No override: position 0 VAE chans = first_frame_cond[:, :, 0]
-    y_normal = _build_y_with_knot(first_frame_cond, knot_override=None, T=T)
-    assert y_normal.shape == (B, 20, T, H, W)
-    assert torch.allclose(y_normal[:, 4:, 0:1], first_frame_cond[:, :, 0:1])
-    assert torch.allclose(y_normal[:, 0:4, 0:1], torch.ones(B, 4, 1, H, W))  # mask=1
+    # No knot (baseline): sliced y at iter > 0 has mask=0 + VAE=0 at position 0
+    y_no_knot = stub._build_y({"first_frame_cond": ffc}, T=4, start_frame=3)
+    assert y_no_knot.shape == (B, 20, 4, H, W)
+    assert torch.allclose(y_no_knot[:, 0:4, 0:1], torch.zeros(B, 4, 1, H, W))
+    assert torch.allclose(y_no_knot[:, 4:, 0:1], torch.zeros(B, C, 1, H, W))
     
-    # With override: position 0 VAE chans = knot
-    y_knot = _build_y_with_knot(first_frame_cond, knot_override=knot, T=T)
-    assert torch.allclose(y_knot[:, 4:, 0:1], knot)
+    # With knot at chunk start: mask=1 + VAE=knot at slice position 0
+    y_knot = stub._build_y(
+        {"first_frame_cond": ffc, "knot_latent_for_chunk_start": knot},
+        T=4, start_frame=3,
+    )
     assert torch.allclose(y_knot[:, 0:4, 0:1], torch.ones(B, 4, 1, H, W))
-    # Positions 1..T-1 unchanged
-    assert torch.allclose(y_knot[:, 4:, 1:], first_frame_cond[:, :, 1:])
+    assert torch.allclose(y_knot[:, 4:, 0:1], knot[:, :, 0:1])
+    # Other slice positions unchanged
+    assert torch.allclose(y_knot[:, 4:, 1:], y_no_knot[:, 4:, 1:])
+    
+    # At iter 0 (start_frame=0): knot injection is a no-op (existing ref behavior wins)
+    y_iter0 = stub._build_y(
+        {"first_frame_cond": ffc, "knot_latent_for_chunk_start": knot},
+        T=4, start_frame=0,
+    )
+    assert torch.allclose(y_iter0[:, 4:, 0:1], ffc[:, :, 0:1])  # reference, not knot
+    assert torch.allclose(y_iter0[:, 0:4, 0:1], torch.ones(B, 4, 1, H, W))  # mask=1 (existing)
 ```
 
 - [ ] **Step 2: Run test**
 
-Run: `python -m pytest tests/test_knot_forcing.py::test_y_tensor_knot_injection -v`
-Expected: FAIL — `_build_y_with_knot` not defined.
+Run: `python -m pytest tests/test_knot_forcing.py::test_build_y_knot_injection -v`
+Expected: FAIL (knot injection not yet implemented).
 
-- [ ] **Step 3: Add helper function**
+- [ ] **Step 3: Modify `_build_y` in `CausalInfiniteTalkWan`**
 
-At module top-level in `fastgen/networks/InfiniteTalk/network_causal.py` (near other helpers around the anchor functions):
+Located around line 1512 in `network_causal.py`. Replace the body:
 
 ```python
-def _build_y_with_knot(first_frame_cond: torch.Tensor,
-                       knot_override: torch.Tensor = None,
-                       T: int = None) -> torch.Tensor:
-    """Build the 20-channel y-tensor (4 mask + 16 VAE) with optional knot override.
-    
-    The y-tensor carries the I2V inpainting conditioning:
-      - channels [0:4] = binary mask, set to 1 at position 0 (ref/knot slot), 0 elsewhere
-      - channels [4:20] = VAE latents. Position 0 = first_frame_cond or knot_override.
-    
-    Args:
-        first_frame_cond: [B, 16, T, H, W] — standard reference image latent.
-        knot_override: Optional [B, 16, 1, H, W] — the knot x̄ from previous chunk.
-            If given, overrides first_frame_cond at position 0 only.
-        T: Number of temporal positions (defaults to first_frame_cond.shape[2]).
-    
-    Returns:
-        y: [B, 20, T, H, W] — concatenated mask + VAE conditioning.
-    """
-    B, C, T_ff, H, W = first_frame_cond.shape
-    if T is None:
-        T = T_ff
-    assert C == 16, f"Expected 16-channel VAE latent, got {C}"
-    
-    mask = torch.zeros(B, 4, T, H, W, dtype=first_frame_cond.dtype, device=first_frame_cond.device)
-    mask[:, :, 0:1] = 1.0
-    
-    vae_chans = first_frame_cond.clone()
-    if knot_override is not None:
-        assert knot_override.shape == (B, 16, 1, H, W), (
-            f"knot_override expected shape ({B}, 16, 1, {H}, {W}), got {knot_override.shape}"
-        )
-        vae_chans[:, :, 0:1] = knot_override
-    
-    return torch.cat([mask, vae_chans], dim=1)
-```
+    def _build_y(
+        self,
+        condition: Dict[str, torch.Tensor],
+        T: int,
+        start_frame: int = 0,
+    ) -> torch.Tensor:
+        first_frame_cond = condition["first_frame_cond"]
+        B, _, T_full, H, W = first_frame_cond.shape
 
-**Note**: this helper duplicates the logic currently inline in `_build_y()` / `generate_infinitetalk_nativeres()`. For now, we keep both codepaths; refactoring to use this helper globally is a follow-up.
+        frame_num = (T_full - 1) * 4 + 1
+        msk = self._construct_i2v_mask(
+            frame_num, H, W,
+            device=first_frame_cond.device,
+            dtype=first_frame_cond.dtype,
+        )
+        msk = msk.expand(B, -1, -1, -1, -1)
+        y_full = torch.cat([msk, first_frame_cond], dim=1)
+
+        # KF: inject knot at position `start_frame` of the full y_full when present.
+        # At iter > 0, this makes the sliced y's position 0 carry mask=1 + VAE(knot).
+        # At iter 0 (start_frame=0), this is a no-op because mask=1 + VAE=ref is
+        # already the correct value at y_full[:, :, 0].
+        knot_latent = condition.get("knot_latent_for_chunk_start")
+        if knot_latent is not None and start_frame > 0:
+            y_full = y_full.clone()
+            y_full[:, 0:4, start_frame:start_frame + 1] = 1.0
+            y_full[:, 4:, start_frame:start_frame + 1] = knot_latent[:, :, 0:1]
+
+        if start_frame > 0 or T < T_full:
+            y = y_full[:, :, start_frame:start_frame + T]
+        else:
+            y = y_full
+        return y
+```
 
 - [ ] **Step 4: Run test**
 
-Run: `python -m pytest tests/test_knot_forcing.py::test_y_tensor_knot_injection -v`
+Run: `python -m pytest tests/test_knot_forcing.py::test_build_y_knot_injection -v`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Regression**
+
+Run: `timeout 180 python -m pytest tests/test_knot_forcing.py tests/test_config_fields.py tests/test_rollout_gradient_sanity.py tests/test_rollout_f3_toggle.py tests/test_sample_loop_toggles.py tests/test_input_anchor_plumbing.py tests/test_apply_anchor_kwarg.py tests/test_apply_attention_config.py tests/test_stochastic_lookahead_distance.py tests/test_rolling_attention.py tests/test_post_step_pin_inference.py tests/test_inference_causal_toggles.py -q 2>&1 | tail -3`
+Expected: All pass (should be 69+ tests: 68 before + 1 new).
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add fastgen/networks/InfiniteTalk/network_causal.py tests/test_knot_forcing.py
-git commit -m "feat(kf): _build_y_with_knot helper — y-tensor with optional knot override at position 0"
+git commit -m "feat(kf): _build_y injects knot at start_frame when condition carries knot_latent_for_chunk_start
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 ```
 
 ---
