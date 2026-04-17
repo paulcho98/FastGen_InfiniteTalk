@@ -743,9 +743,13 @@ git commit -m "feat(kf): _apply_running_ahead_config — stamps attrs on student
 
 ---
 
-### Task 9: Sink KV re-cache helper — re-encode reference at new RoPE position
+### Task 9: (DROPPED — unnecessary under dynamic RoPE)
 
-When running-ahead fires and advances `n`, the sink KV needs to be re-computed at the new absolute RoPE position. The sink holds the reference image's KV, so we re-run the model's "cache-store" forward on `first_frame_cond` but with the new RoPE position.
+**Analysis during Phase 4 implementation**: under `use_dynamic_rope=True` (which KF requires), the K tensor is stored UN-ROTATED in the KV cache. The RoPE rotation is applied at each attention read via `_apply_window_rope`. When `advance_running_ahead` updates `_running_ahead_n`, the NEXT attention call automatically reads the new value via `getattr(self, "_running_ahead_n")` inside `CausalSelfAttention.forward` and passes it through as the sink's RoPE position.
+
+So the paper's "re-cache KV_ref at new position" (Algorithm 1 line 8) is implicit in our dynamic-RoPE architecture — no explicit re-cache forward is needed.
+
+### Task 9 (OLD): Sink KV re-cache helper
 
 **Files:**
 - Modify: `fastgen/networks/InfiniteTalk/network_causal.py`
