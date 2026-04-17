@@ -335,3 +335,46 @@ def test_maybe_pad_audio_for_knot_extends_repeat_last():
     assert torch.allclose(out[:21], audio)
     assert torch.allclose(out[21], audio[20])
     assert torch.allclose(out[24], audio[20])
+
+
+def test_kf_off_is_default_bit_exact_config():
+    """All KF flags default to off → KF-off code path is the existing SF path."""
+    from fastgen.configs.methods.config_infinitetalk_sf import InfiniteTalkSFModelConfig
+    cfg = InfiniteTalkSFModelConfig()
+    # Each KF flag is off by default
+    assert cfg.use_temporal_knot is False
+    assert cfg.use_running_ahead is False
+    assert cfg.use_last_frame_reference is False
+    # KF-off path gates:
+    #   - rollout_with_gradient: use_knot=False → k=0, denoise_len=chunk_size, no noise extension
+    #   - _student_sample_loop: same
+    #   - inference_causal run_inference: same
+    #   - _build_y: knot_latent key absent → no injection
+    # Validator passes on all-off
+    cfg.validate_kf_flags()
+
+
+def test_kf_training_config_round_trip():
+    """The full KF training config loads, passes validation, and has expected knobs."""
+    from fastgen.configs.experiments.InfiniteTalk.config_sf_w9s1_knot_runahead import (
+        create_config,
+    )
+    c = create_config()
+    # Core KF flags
+    assert c.model.use_temporal_knot is True
+    assert c.model.knot_size == 1
+    assert c.model.use_running_ahead is True
+    assert c.model.running_ahead_step == 4
+    assert c.model.running_ahead_init_n == 8
+    assert c.model.use_last_frame_reference is True
+    # F1/F2/F3 off (mutually exclusive or redundant under KF)
+    assert c.model.lookahead_sink_enabled is False
+    assert c.model.model_sink_cache_enabled is False
+    assert c.model.skip_clean_cache_pass is False
+    # Dynamic RoPE required for running-ahead's sink position override
+    assert c.model.net.use_dynamic_rope is True
+    # Dataloader gets both KF options
+    assert c.dataloader_train.use_last_frame_reference is True
+    assert c.dataloader_train.knot_size_extra_audio_pixel == 4
+    # Validator passes (no incompatible flags)
+    c.model.validate_kf_flags()
