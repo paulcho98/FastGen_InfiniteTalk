@@ -76,6 +76,24 @@ class InfiniteTalkSFModelConfig(SFModelConfig):
     # would paradoxically keep it anchoring, so we use the hard-disable path instead.
     teacher_anchor_disabled: bool = False
 
+    # ── Knot Forcing (KF) flags — all default off, KF-off = bit-exact existing SF ──
+    # Temporal knot: denoise c+k frames per chunk, commit c, hold k as knot,
+    # inject previous knot via I2V mask on frame 0 of next chunk, fuse boundaries.
+    use_temporal_knot: bool = False
+    knot_size: int = 1
+
+    # Running-ahead: reference KV at dynamic absolute RoPE position; advances by
+    # running_ahead_step when the rollout cursor catches up. Initial position
+    # given by running_ahead_init_n. Must be mutually exclusive with
+    # lookahead_sink (F1) — validated at runtime.
+    use_running_ahead: bool = False
+    running_ahead_step: int = 4
+    running_ahead_init_n: int = 8
+
+    # Dataloader: use last frame of clip as reference (first_frame_cond source)
+    # instead of the first frame. Encodes via vae_latents[:, :, -1:] broadcast.
+    use_last_frame_reference: bool = False
+
     # Lookahead attention sink (Feature 1):
     # When True, the sink K/V (stored at buffer positions [0, sink_size) in
     # frames) is rotated at attention read-time with a RoPE temporal position
