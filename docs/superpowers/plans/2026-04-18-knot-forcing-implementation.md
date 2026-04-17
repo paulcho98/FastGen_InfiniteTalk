@@ -1222,7 +1222,9 @@ git commit -m "feat(kf): inference_causal.py — KF CLI flags + run_inference KF
 
 ### Task 15: Ensure audio_emb can handle c+k slices per chunk
 
-Audio is precomputed for the entire clip (`audio_emb: [num_latent_frames, 12, 768]`). The dataloader already loads the full tensor. For KF we slice `audio_emb[i:i+c+k]` per chunk. For the last chunk (iter 6 with num_frames=21 + k=1 = 22 needed), audio_emb only has 21 slices.
+Audio is precomputed for the full clip. The dataloader already loads the full tensor and asserts `audio_emb.shape[0] >= _train_pixel_frames`, slicing to exactly `_train_pixel_frames`.
+
+**Key check**: the stored audio may already have more slices than `_train_pixel_frames` (if precompute used a larger `num_video_frames`). If so, we can just slice more for KF — no padding needed. If stored audio is exactly `_train_pixel_frames`, we right-pad by k extra latent-frame-equivalent pixel slices (repeat last slice). Task 15 covers both cases.
 
 **Files:**
 - Modify: `fastgen/datasets/infinitetalk_dataloader.py`
@@ -1236,13 +1238,14 @@ def test_audio_emb_padded_for_kf():
     from fastgen.datasets.infinitetalk_dataloader import _maybe_pad_audio_for_knot
     audio = torch.arange(21 * 12 * 768, dtype=torch.float32).reshape(21, 12, 768)
     # Non-KF: unchanged
-    out = _maybe_pad_audio_for_knot(audio, extra_k=0)
+    out = _maybe_pad_audio_for_knot(audio, extra=0)
     assert out.shape == audio.shape
-    # KF with k=1: last slice repeated
-    out_k1 = _maybe_pad_audio_for_knot(audio, extra_k=1)
-    assert out_k1.shape == (22, 12, 768)
-    assert torch.allclose(out_k1[:21], audio)
-    assert torch.allclose(out_k1[21], audio[20])  # last slice repeated
+    # KF with extra=4 pixel frames: last slice repeated 4x
+    out_k = _maybe_pad_audio_for_knot(audio, extra=4)
+    assert out_k.shape == (25, 12, 768)
+    assert torch.allclose(out_k[:21], audio)
+    assert torch.allclose(out_k[21], audio[20])  # last slice repeated
+    assert torch.allclose(out_k[24], audio[20])
 ```
 
 - [ ] **Step 2: Run test**
@@ -1250,27 +1253,48 @@ def test_audio_emb_padded_for_kf():
 Run: `python -m pytest tests/test_knot_forcing.py::test_audio_emb_padded_for_kf -v`
 Expected: FAIL
 
-- [ ] **Step 3: Add helper**
+- [ ] **Step 3: Modify audio slicing in `__getitem__`**
 
-Add to `fastgen/datasets/infinitetalk_dataloader.py`:
+In `fastgen/datasets/infinitetalk_dataloader.py::__getitem__`, locate the block:
 
 ```python
-def _maybe_pad_audio_for_knot(audio_emb: torch.Tensor, extra_k: int) -> torch.Tensor:
-    """Right-pad audio_emb by extra_k slices (repeat last) to support KF's
-    c+k-frame last chunk. No-op when extra_k=0."""
-    if extra_k <= 0:
+        audio_emb = audio_emb[:self._train_pixel_frames]  # [train_pixel_frames, 12, 768]
+```
+
+Replace with:
+
+```python
+        # KF: extend slice by extra_k_pixel frames if available on disk; else pad.
+        extra_k_pixel = getattr(self, "knot_size_extra_audio_pixel", 0)
+        target_len = self._train_pixel_frames + extra_k_pixel
+        if audio_emb.shape[0] >= target_len:
+            # Enough stored on disk — just slice more.
+            audio_emb = audio_emb[:target_len]
+        else:
+            # Slice to what's available, then repeat-last-pad to target_len.
+            audio_emb = audio_emb[:self._train_pixel_frames]
+            audio_emb = _maybe_pad_audio_for_knot(audio_emb, target_len - audio_emb.shape[0])
+```
+
+Add helper at module level:
+
+```python
+def _maybe_pad_audio_for_knot(audio_emb: torch.Tensor, extra: int) -> torch.Tensor:
+    """Right-pad audio_emb by `extra` slices (repeat last). No-op when extra <= 0."""
+    if extra <= 0:
         return audio_emb
-    last = audio_emb[-1:]  # [1, ...]
-    pad = last.repeat(extra_k, *([1] * (audio_emb.dim() - 1)))
+    last = audio_emb[-1:]
+    pad = last.repeat(extra, *([1] * (audio_emb.dim() - 1)))
     return torch.cat([audio_emb, pad], dim=0)
 ```
 
-Wire into `__getitem__` after loading `audio_emb`:
+Add to `__init__`:
 
 ```python
-        extra_k = getattr(self, "knot_size_extra_audio", 0)
-        audio_emb = _maybe_pad_audio_for_knot(audio_emb, extra_k)
+        self.knot_size_extra_audio_pixel = kwargs.get("knot_size_extra_audio_pixel", 0)
 ```
+
+**Choosing `knot_size_extra_audio_pixel`**: for our quarter-res setup with num_latent_frames=21 and _train_pixel_frames=81, one latent frame ≈ 4 pixel frames. So for k=1, set `knot_size_extra_audio_pixel = 4`. The config propagates this from `config.model.knot_size * vae_temporal_stride` (approximately 4).
 
 And in `__init__`:
 
@@ -1353,7 +1377,8 @@ def create_config():
     config.model.use_last_frame_reference = True
     # Propagate to dataloader
     config.dataloader_train.use_last_frame_reference = True
-    config.dataloader_train.knot_size_extra_audio = 1
+    # k=1 latent frame ≈ 4 video pixel frames (VAE temporal stride ~3.86)
+    config.dataloader_train.knot_size_extra_audio_pixel = 4
     
     # ---- Validate ----
     config.model.validate_kf_flags()
