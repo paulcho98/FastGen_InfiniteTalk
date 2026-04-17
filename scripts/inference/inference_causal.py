@@ -320,6 +320,18 @@ def parse_args():
     p.add_argument("--skip_clean_cache_pass", action="store_true",
                    help="Skip the separate clean-cache forward pass (F3). Last denoise step "
                         "caches slightly-noisy K/V instead.")
+    p.add_argument("--use_temporal_knot", action="store_true",
+                   help="Enable Knot Forcing temporal knot (c+k denoise window, fusion, commit-c).")
+    p.add_argument("--knot_size", type=int, default=1,
+                   help="Knot length k (paper uses 1).")
+    p.add_argument("--use_running_ahead", action="store_true",
+                   help="Enable running-ahead dynamic sink RoPE + re-cache.")
+    p.add_argument("--running_ahead_step", type=int, default=4,
+                   help="Running-ahead step s.")
+    p.add_argument("--running_ahead_init_n", type=int, default=8,
+                   help="Initial reference RoPE position.")
+    p.add_argument("--use_last_frame_reference", action="store_true",
+                   help="Source the reference image from the last video frame latent (KF training convention).")
     p.add_argument("--preprocess_mode", type=str, default="crop",
                    choices=["crop", "pad"],
                    help="Preprocessing for raw/video inputs: 'crop' = resize+center-crop "
@@ -796,9 +808,20 @@ def load_diffusion_model(args, num_latent, device, dtype):
     model._model_sink_cache = args.model_sink_cache
     model._skip_clean_cache_pass = args.skip_clean_cache_pass
 
+    # KF attrs — read by run_inference to activate KF branches
+    model._use_temporal_knot = bool(args.use_temporal_knot)
+    model._knot_size = int(args.knot_size)
+    model._running_ahead_enabled = bool(args.use_running_ahead)
+    model._running_ahead_step = int(args.running_ahead_step)
+    model._running_ahead_n = int(args.running_ahead_init_n)
+
     print(f"  Lookahead sink: {'ON, distance=' + str(args.lookahead_distance) if args.lookahead_sink else 'OFF'}")
     print(f"  Model-generated sink cache (F2): {'ON' if args.model_sink_cache else 'OFF'}")
     print(f"  Skip clean cache pass (F3): {'ON' if args.skip_clean_cache_pass else 'OFF'}")
+    print(f"  Knot Forcing (KF): "
+          f"{'ON, k=' + str(args.knot_size) if args.use_temporal_knot else 'OFF'}")
+    print(f"  Running-ahead: "
+          f"{'ON, step=' + str(args.running_ahead_step) + ', init_n=' + str(args.running_ahead_init_n) if args.use_running_ahead else 'OFF'}")
 
     # --- Load DF/SF checkpoint overlay ---
     # Expects a monolithic .pth with full state_dict. For FSDP-sharded training
@@ -916,20 +939,61 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
     debug_trace = os.environ.get("LOOKAHEAD_DEBUG_TRACE") == "1"
     last_step_idx = num_denoise_steps - 1
 
+    # ── KF flags ──
+    use_knot = getattr(model, "_use_temporal_knot", False)
+    k = int(getattr(model, "_knot_size", 1)) if use_knot else 0
+    denoise_len = chunk_size + k  # c+k under KF, c otherwise
+
+    # Running-ahead import (lazy to avoid circular at module load)
+    from fastgen.networks.InfiniteTalk.network_causal import advance_running_ahead
+
+    # Under KF, extend the internal noise by k frames for the last chunk's knot slot
+    if use_knot:
+        extra_k_noise = torch.randn(
+            B, C, k, H_lat, W_lat,
+            generator=generator, device=device, dtype=dtype,
+        )
+        noise_ext = torch.cat([noise, extra_k_noise], dim=2)
+    else:
+        noise_ext = noise
+
+    # KF state — knot_latent buffer populated at iter 0 exit step, used at iter 1+
+    knot_latent = None
+    # F3 under KF — forced off so cache captures committed c frames only
+    skip_clean_cache_effective = skip_clean_cache and not use_knot
+
     _ar_total_h = timer.start()
 
     for block_idx in range(num_blocks):
         cur_start_frame = block_idx * chunk_size
-        noisy_input = noise[:, :, cur_start_frame:cur_start_frame + chunk_size]
+
+        # Running-ahead advance (dynamic sink RoPE); re-cache implicit under dynamic RoPE
+        if getattr(model, "_running_ahead_enabled", False):
+            advance_running_ahead(model, i=cur_start_frame, c=chunk_size, k=k)
+
+        cur_end = cur_start_frame + denoise_len
+        noisy_input = noise_ext[:, :, cur_start_frame:cur_end]
 
         is_sink_chunk = (cur_start_frame == 0)
         f2_active = model_sink_cache and is_sink_chunk
-        do_cache_pass = (not skip_clean_cache) or f2_active
+        # KF always runs separate cache pass; F3 disabled under KF.
+        do_cache_pass = (not skip_clean_cache_effective) or f2_active or use_knot
+
+        # KF iter > 0: inject knot via condition + pin x_t[:, :, 0:k] to clean knot
+        if use_knot and block_idx > 0 and knot_latent is not None:
+            chunk_condition = dict(condition) if isinstance(condition, dict) else condition
+            if isinstance(chunk_condition, dict):
+                chunk_condition["knot_latent_for_chunk_start"] = knot_latent
+            noisy_input = noisy_input.clone()
+            noisy_input[:, :, 0:k] = knot_latent
+        else:
+            chunk_condition = condition
 
         _block_denoise_h = timer.start()
         for step_idx in range(num_denoise_steps):
             is_last = (step_idx == last_step_idx)
-            store_kv_here = skip_clean_cache and is_last and not f2_active
+            # F3 store_kv only when KF off; KF always uses separate cache pass
+            store_kv_here = skip_clean_cache_effective and is_last and not f2_active
             apply_anchor_here = anchor_first_frame and not (f2_active and is_last)
             # anchor_input_only: feed model clean frame 0 (input anchor) but
             # let the model's output be raw (no output anchor). This isolates
@@ -944,7 +1008,8 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
             if debug_trace:
                 print(f"[sample_loop] chunk_idx={block_idx} start={cur_start_frame} "
                       f"step={step_idx} is_last={is_last} store_kv={store_kv_here} "
-                      f"apply_anchor={apply_anchor_here} f2_active={f2_active}")
+                      f"apply_anchor={apply_anchor_here} f2_active={f2_active} "
+                      f"use_knot={use_knot}")
 
             t_cur = t_list_t[step_idx]
             t_next = t_list_t[step_idx + 1]
@@ -964,7 +1029,7 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
             x0_pred = model(
                 noisy_input,
                 t_cur.expand(B),
-                condition=condition,
+                condition=chunk_condition,
                 cur_start_frame=cur_start_frame,
                 store_kv=store_kv_here,
                 is_ar=True,
@@ -1001,21 +1066,39 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
                 if anchor_first_frame and cur_start_frame == 0 and isinstance(condition, dict) and "first_frame_cond" in condition:
                     noisy_input = noisy_input.clone()
                     noisy_input[:, :, 0:1] = first_frame_latent
+                # KF iter > 0: re-pin the knot at position 0 after forward_process
+                if use_knot and block_idx > 0 and knot_latent is not None:
+                    noisy_input = noisy_input.clone()
+                    noisy_input[:, :, 0:k] = knot_latent
             else:
                 noisy_input = x0_pred
 
+            # KF last step: Eq. 5 fusion + save new knot
+            if is_last and use_knot:
+                if block_idx > 0 and knot_latent is not None:
+                    x0_pred = x0_pred.clone()
+                    x0_pred[:, :, 0:k] = (knot_latent + x0_pred[:, :, 0:k]) / 2.0
+                knot_latent = x0_pred[:, :, chunk_size:chunk_size + k].clone()
+
+        # Determine committed slice under KF (first c frames only)
+        if use_knot:
+            committed = x0_pred[:, :, 0:chunk_size]
+        else:
+            committed = x0_pred
+
         # Write displayed output. For F2 on sink chunk, manually anchor frame 0.
         if f2_active and anchor_first_frame and isinstance(condition, dict) and "first_frame_cond" in condition:
-            x_display = x0_pred.clone()
+            x_display = committed.clone()
             x_display[:, :, 0:1] = first_frame_latent
             output[:, :, cur_start_frame:cur_start_frame + chunk_size] = x_display
         else:
-            output[:, :, cur_start_frame:cur_start_frame + chunk_size] = x0_pred
+            output[:, :, cur_start_frame:cur_start_frame + chunk_size] = committed
         timer.stop(_block_denoise_h, "ar/block_denoise")
 
         if do_cache_pass:
             _block_cache_h = timer.start()
-            cache_input = x0_pred  # non-anchored when f2_active
+            # Under KF, cache the committed c frames (not the knot).
+            cache_input = committed if use_knot else x0_pred  # non-anchored when f2_active
 
             # Diagnostic: capture cache-store input frame 0 on chunk 0
             if diagnostics is not None and cur_start_frame == 0:
@@ -1030,9 +1113,9 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
 
             t_cache = torch.full((B,), context_noise, device=device, dtype=dtype)
             if context_noise > 0:
-                cache_eps = torch.randn_like(x0_pred)
+                cache_eps = torch.randn_like(cache_input)
                 cache_input = model.noise_scheduler.forward_process(
-                    x0_pred, cache_eps,
+                    cache_input, cache_eps,
                     torch.tensor(context_noise, device=device, dtype=torch.float64).expand(B),
                 )
             if anchor_input_only:
