@@ -1523,9 +1523,17 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
 
         In AR mode, the conditioning is sliced to [start_frame : start_frame + T].
 
+        Knot Forcing: when ``condition["knot_latent_for_chunk_start"]`` is
+        provided and ``start_frame > 0``, the full y-tensor is modified at
+        position ``start_frame`` to carry mask=1 + VAE(knot) before slicing.
+        This means the sliced y's position 0 will show the knot as a
+        reference-like condition for the chunk. At start_frame=0 the flag is
+        a no-op because the reference image already occupies that slot.
+
         Args:
             condition: Dict containing ``"first_frame_cond"`` with shape
-                ``[B, 16, T_full, H, W]``.
+                ``[B, 16, T_full, H, W]``. Optionally ``"knot_latent_for_chunk_start"``
+                with shape ``[B, 16, 1, H, W]``.
             T: Number of latent time steps for this call.
             start_frame: Starting latent frame index (0 for full sequence).
 
@@ -1547,6 +1555,16 @@ class CausalInfiniteTalkWan(CausalFastGenNetwork):
 
         # Concatenate: [B, 4, T_full, H, W] + [B, 16, T_full, H, W] -> [B, 20, T_full, H, W]
         y_full = torch.cat([msk, first_frame_cond], dim=1)
+
+        # KF: inject knot at position `start_frame` of the full y_full when present.
+        # At iter > 0, this makes the sliced y's position 0 carry mask=1 + VAE(knot).
+        # At iter 0 (start_frame=0), this is a no-op because mask=1 + VAE=ref is
+        # already the correct value at y_full[:, :, 0].
+        knot_latent = condition.get("knot_latent_for_chunk_start")
+        if knot_latent is not None and start_frame > 0:
+            y_full = y_full.clone()
+            y_full[:, 0:4, start_frame:start_frame + 1] = 1.0
+            y_full[:, 4:, start_frame:start_frame + 1] = knot_latent[:, :, 0:1]
 
         # Slice to current chunk if needed
         if start_frame > 0 or T < T_full:
