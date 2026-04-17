@@ -32,6 +32,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 
 import librosa
 import numpy as np
@@ -60,6 +61,148 @@ def _get_ffmpeg():
         return imageio_ffmpeg.get_ffmpeg_exe()
     except ImportError:
         raise RuntimeError("ffmpeg not found. Install ffmpeg or pip install imageio-ffmpeg.")
+
+
+# ===========================================================================
+# Timing utility
+# ===========================================================================
+
+class _NoopTimingCtx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _TimingCtx:
+    def __init__(self, timer, label, use_cuda):
+        self._timer = timer
+        self._label = label
+        self._use_cuda = use_cuda
+
+    def __enter__(self):
+        if self._use_cuda:
+            self._start = torch.cuda.Event(enable_timing=True)
+            self._end = torch.cuda.Event(enable_timing=True)
+            self._start.record()
+        else:
+            self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        if self._use_cuda:
+            self._end.record()
+            torch.cuda.synchronize()
+            ms = self._start.elapsed_time(self._end)
+        else:
+            ms = (time.perf_counter() - self._t0) * 1000.0
+        self._timer._record(self._label, ms)
+        return False
+
+
+class PipelineTimer:
+    """GPU-synchronized stopwatch. Accumulates elapsed ms by label.
+
+    Usage:
+        timer = PipelineTimer(enabled=True)
+        with timer.section("setup/load_model"):
+            ...
+        with timer.section("ar/block_denoise"):
+            ...
+        timer.report("Sample 1 timing")
+
+    Labels with the same name accumulate — `n` in the report is the call count.
+    Use "/" to create natural prefixes for grouped reporting via `subreport`.
+    Disabled timers are no-ops (no CUDA sync cost).
+    """
+
+    def __init__(self, enabled: bool = False):
+        self.enabled = enabled
+        self._use_cuda = torch.cuda.is_available()
+        self.timings: dict[str, list[float]] = {}
+
+    def section(self, label: str):
+        if not self.enabled:
+            return _NoopTimingCtx()
+        return _TimingCtx(self, label, self._use_cuda)
+
+    def start(self):
+        """Return an opaque handle; pair with stop(handle, label).
+
+        Useful when `with timer.section(...)` would force invasive re-indenting
+        of an existing loop. Returns None when disabled (stop is a no-op).
+        """
+        if not self.enabled:
+            return None
+        if self._use_cuda:
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            return ev
+        return time.perf_counter()
+
+    def stop(self, handle, label: str):
+        if not self.enabled or handle is None:
+            return
+        if self._use_cuda:
+            end_ev = torch.cuda.Event(enable_timing=True)
+            end_ev.record()
+            torch.cuda.synchronize()
+            ms = handle.elapsed_time(end_ev)
+        else:
+            ms = (time.perf_counter() - handle) * 1000.0
+        self._record(label, ms)
+
+    def _record(self, label: str, ms: float):
+        self.timings.setdefault(label, []).append(ms)
+
+    def reset(self):
+        self.timings.clear()
+
+    def has(self, prefix: str) -> bool:
+        return any(k.startswith(prefix) for k in self.timings)
+
+    def total(self, prefix: str = "") -> float:
+        return sum(sum(v) for k, v in self.timings.items() if k.startswith(prefix))
+
+    def report(self, title: str, prefix: str = ""):
+        if not self.enabled:
+            return
+        rows = [(k, v) for k, v in self.timings.items() if k.startswith(prefix)]
+        if not rows:
+            return
+        self._print_table(title, rows)
+
+    def snapshot(self) -> dict:
+        """Capture current call counts per label. Use with report_since()."""
+        return {k: len(v) for k, v in self.timings.items()}
+
+    def report_since(self, snap: dict, title: str, prefix: str = ""):
+        """Report only entries added since `snap` was taken."""
+        if not self.enabled:
+            return
+        rows = []
+        for label, vals in self.timings.items():
+            if not label.startswith(prefix):
+                continue
+            offset = snap.get(label, 0)
+            if offset < len(vals):
+                rows.append((label, vals[offset:]))
+        if not rows:
+            return
+        self._print_table(title, rows)
+
+    def _print_table(self, title: str, rows):
+        print(f"\n{title}")
+        print(f"  {'Phase':<36} {'N':>4} {'Total (ms)':>12} {'Avg (ms)':>10} "
+              f"{'Min (ms)':>10} {'Max (ms)':>10}")
+        print("  " + "-" * 86)
+        for label, vals in rows:
+            n = len(vals)
+            total = sum(vals)
+            avg = total / n
+            print(f"  {label:<36} {n:>4} {total:>12.1f} {avg:>10.1f} "
+                  f"{min(vals):>10.1f} {max(vals):>10.1f}")
 
 
 # ===========================================================================
@@ -192,6 +335,13 @@ def parse_args():
                         "sink chunk (chunk 0). Decodes input/output at each denoising "
                         "step and the cache-store input to verify anchoring. "
                         "Adds ~10 VAE decodes per sample.")
+    p.add_argument("--profile_timing", action="store_true",
+                   help="Record GPU-synchronized per-phase timings (setup, per-sample "
+                        "encoding, AR loop per-block, VAE decode, ffmpeg mux) and "
+                        "print a summary at the end of each sample plus a cumulative "
+                        "summary at the end of the run. Adds torch.cuda.synchronize() "
+                        "at each phase boundary — small but measurable overhead, off "
+                        "by default.")
 
     args = p.parse_args()
 
@@ -716,8 +866,15 @@ def load_diffusion_model(args, num_latent, device, dtype):
 @torch.no_grad()
 def run_inference(model, condition, num_latent_frames, chunk_size,
                   context_noise, seed, device, dtype, anchor_first_frame=True,
-                  anchor_input_only=False, debug_anchor_vis=False):
-    """Block-wise autoregressive inference — no CFG, no gradients."""
+                  anchor_input_only=False, debug_anchor_vis=False, timer=None):
+    """Block-wise autoregressive inference — no CFG, no gradients.
+
+    When ``timer`` is provided (enabled), records under labels:
+      ``ar/block_denoise`` (one per block), ``ar/block_cache_pass`` (one per
+      block that runs a separate cache pass), ``ar/total`` (total AR loop).
+    """
+    if timer is None:
+        timer = PipelineTimer(enabled=False)
     B = 1
     C = 16
     H_lat = condition["first_frame_cond"].shape[3]
@@ -759,6 +916,8 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
     debug_trace = os.environ.get("LOOKAHEAD_DEBUG_TRACE") == "1"
     last_step_idx = num_denoise_steps - 1
 
+    _ar_total_h = timer.start()
+
     for block_idx in range(num_blocks):
         cur_start_frame = block_idx * chunk_size
         noisy_input = noise[:, :, cur_start_frame:cur_start_frame + chunk_size]
@@ -767,6 +926,7 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
         f2_active = model_sink_cache and is_sink_chunk
         do_cache_pass = (not skip_clean_cache) or f2_active
 
+        _block_denoise_h = timer.start()
         for step_idx in range(num_denoise_steps):
             is_last = (step_idx == last_step_idx)
             store_kv_here = skip_clean_cache and is_last and not f2_active
@@ -851,8 +1011,10 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
             output[:, :, cur_start_frame:cur_start_frame + chunk_size] = x_display
         else:
             output[:, :, cur_start_frame:cur_start_frame + chunk_size] = x0_pred
+        timer.stop(_block_denoise_h, "ar/block_denoise")
 
         if do_cache_pass:
+            _block_cache_h = timer.start()
             cache_input = x0_pred  # non-anchored when f2_active
 
             # Diagnostic: capture cache-store input frame 0 on chunk 0
@@ -899,6 +1061,7 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
                 apply_input_anchor=apply_anchor_cache_in,
                 use_gradient_checkpointing=False,
             )
+            timer.stop(_block_cache_h, "ar/block_cache_pass")
 
         if diagnostics is not None and cur_start_frame == 0 and not do_cache_pass:
             print(f"    [diag] c0: F3 on — no separate cache pass; "
@@ -906,6 +1069,8 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
 
         print(f"    Block {block_idx + 1}/{num_blocks} done "
               f"(frames {cur_start_frame}-{cur_start_frame + chunk_size - 1})")
+
+    timer.stop(_ar_total_h, "ar/total")
 
     model.clear_caches()
     return output, diagnostics
@@ -916,9 +1081,16 @@ def run_inference(model, condition, num_latent_frames, chunk_size,
 # ===========================================================================
 
 @torch.no_grad()
-def decode_and_save(vae, output_latents, audio_path, output_path, fps, device):
-    """VAE decode latents -> normalize -> save video -> mux audio."""
+def decode_and_save(vae, output_latents, audio_path, output_path, fps, device, timer=None):
+    """VAE decode latents -> normalize -> save video -> mux audio.
+
+    When ``timer`` is enabled, records under labels ``decode/vae``,
+    ``decode/encode_mp4``, and ``decode/ffmpeg_mux``.
+    """
     import imageio
+
+    if timer is None:
+        timer = PipelineTimer(enabled=False)
 
     print("Decoding latents with VAE (float32)...")
 
@@ -928,6 +1100,8 @@ def decode_and_save(vae, output_latents, audio_path, output_path, fps, device):
     vae.std = vae.std.to(device)
     vae.scale = [vae.mean, 1.0 / vae.std]
     latent = output_latents[0].to(device=device, dtype=torch.float32)
+
+    _vae_h = timer.start()
     video_tensor = vae.decode([latent])
 
     if isinstance(video_tensor, (list, tuple)):
@@ -937,6 +1111,7 @@ def decode_and_save(vae, output_latents, audio_path, output_path, fps, device):
 
     video = (video_tensor.clamp(-1, 1) + 1) / 2 * 255
     video = video.permute(1, 2, 3, 0).cpu().numpy().astype(np.uint8)
+    timer.stop(_vae_h, "decode/vae")
     print(f"  Decoded video: {video.shape} (T, H, W, C)")
 
     if audio_path is not None:
@@ -946,15 +1121,18 @@ def decode_and_save(vae, output_latents, audio_path, output_path, fps, device):
         silent_path = output_path
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    _enc_h = timer.start()
     writer = imageio.get_writer(silent_path, fps=fps, codec="libx264", quality=8)
     for frame in video:
         writer.append_data(frame)
     writer.close()
+    timer.stop(_enc_h, "decode/encode_mp4")
     print(f"  Saved silent video: {silent_path}")
 
     if audio_path is not None:
         duration_s = video.shape[0] / fps
         ffmpeg = _get_ffmpeg()
+        _mux_h = timer.start()
         subprocess.run([
             ffmpeg, "-y",
             "-i", silent_path,
@@ -963,6 +1141,7 @@ def decode_and_save(vae, output_latents, audio_path, output_path, fps, device):
             "-t", f"{duration_s:.3f}",
             output_path,
         ], check=True, capture_output=True)
+        timer.stop(_mux_h, "decode/ffmpeg_mux")
         if os.path.exists(output_path) and silent_path != output_path:
             os.remove(silent_path)
         print(f"  Muxed with audio: {output_path}")
@@ -1039,24 +1218,32 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = args.dtype
 
+    timer = PipelineTimer(enabled=args.profile_timing)
+
     print("=" * 60)
     print("Causal InfiniteTalk Inference")
     print("=" * 60)
+    if args.profile_timing:
+        print("[profile_timing] ON — per-phase timings will be reported per sample")
 
     # ------------------------------------------------------------------
     # Step 1: Encode text (T5 loaded/unloaded first to save VRAM)
     # ------------------------------------------------------------------
     print("\n[1/5] Text encoding...")
+    _h = timer.start()
     text_embeds = encode_text(
         args.prompt, args.t5_path, args.t5_tokenizer,
         args.text_embeds_path, device=device,
     )
+    timer.stop(_h, "setup/encode_text")
 
     # ------------------------------------------------------------------
     # Step 2: Load VAE (kept for entire session)
     # ------------------------------------------------------------------
     print("\n[2/5] Loading VAE...")
+    _h = timer.start()
     vae = load_vae(args.vae_path, device="cpu")
+    timer.stop(_h, "setup/load_vae")
 
     # ------------------------------------------------------------------
     # Step 3: Build sample list
@@ -1105,8 +1292,10 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
         print(f"\n[3/5] Video dir batch mode: {len(video_files)} videos in {args.video_dir}")
 
+        _h = timer.start()
         clip_model = load_clip(args.clip_path, device=device)
         wav2vec_fe, wav2vec_model = load_wav2vec(args.wav2vec_path, device=device)
+        timer.stop(_h, "setup/load_encoders")
 
         raw_encoded_list = []
         for vi, vpath in enumerate(video_files):
@@ -1116,13 +1305,19 @@ def main():
             num_latent_v, num_video_v = compute_generation_length(
                 audio_path, args.num_latent_frames, args.chunk_size, args.fps
             )
+            _h = timer.start()
             ffc = encode_reference_image(vae, pil_image, num_latent_v,
                                          target_h=args.target_h, target_w=args.target_w, device=device,
                                          preprocess_mode=args.preprocess_mode)
+            timer.stop(_h, "encode/reference_image_vae")
+            _h = timer.start()
             cf = encode_clip(clip_model, pil_image, device=device,
                             target_h=args.target_h, target_w=args.target_w,
                             preprocess_mode=args.preprocess_mode)
+            timer.stop(_h, "encode/clip")
+            _h = timer.start()
             ae = encode_audio_from_file(wav2vec_fe, wav2vec_model, audio_path, num_video_v, device=device)
+            timer.stop(_h, "encode/audio_wav2vec")
             raw_encoded_list.append({
                 "first_frame_cond": ffc.cpu(), "clip_features": cf.cpu(),
                 "audio_emb": ae.cpu(), "text_embeds": text_embeds.cpu(),
@@ -1151,16 +1346,24 @@ def main():
             audio_path, args.num_latent_frames, args.chunk_size, args.fps
         )
 
+        _h = timer.start()
         clip_model = load_clip(args.clip_path, device=device)
         wav2vec_fe, wav2vec_model = load_wav2vec(args.wav2vec_path, device=device)
+        timer.stop(_h, "setup/load_encoders")
 
+        _h = timer.start()
         first_frame_cond = encode_reference_image(vae, pil_image, num_latent,
                                                      target_h=args.target_h, target_w=args.target_w, device=device,
                                                      preprocess_mode=args.preprocess_mode)
+        timer.stop(_h, "encode/reference_image_vae")
+        _h = timer.start()
         clip_features = encode_clip(clip_model, pil_image, device=device,
                                     target_h=args.target_h, target_w=args.target_w,
                                     preprocess_mode=args.preprocess_mode)
+        timer.stop(_h, "encode/clip")
+        _h = timer.start()
         audio_emb = encode_audio_from_file(wav2vec_fe, wav2vec_model, audio_path, num_video, device=device)
+        timer.stop(_h, "encode/audio_wav2vec")
 
         del clip_model, wav2vec_fe, wav2vec_model
         torch.cuda.empty_cache()
@@ -1197,7 +1400,9 @@ def main():
         del first_data
 
     print("\n[4/5] Loading diffusion model...")
+    _h = timer.start()
     model = load_diffusion_model(args, init_num_latent, device, dtype)
+    timer.stop(_h, "setup/load_model")
 
     # ------------------------------------------------------------------
     # Step 5: Per-sample inference loop (× anchor modes if requested)
@@ -1221,6 +1426,8 @@ def main():
         print(f"[5/5] Sample {sample_idx + 1}/{total}" +
               (f": {sample_name}" if sample_name else ""))
         print("=" * 60)
+        sample_snap = timer.snapshot()
+        _sample_total_h = timer.start()
 
         # Per-mode resume check: skip the whole sample if all modes' outputs already exist.
         per_mode_paths = []
@@ -1290,11 +1497,12 @@ def main():
                 anchor_first_frame=anchor,
                 anchor_input_only=args.anchor_input_only,
                 debug_anchor_vis=args.debug_anchor_vis,
+                timer=timer,
             )
 
             # Decode and save
             print(f"  Decoding and saving [{tag}]...")
-            decode_and_save(vae, output_latents, audio_path, out_path, args.fps, device)
+            decode_and_save(vae, output_latents, audio_path, out_path, args.fps, device, timer=timer)
             print(f"  Output: {out_path}")
 
             # Save anchor diagnostics if requested
@@ -1314,10 +1522,19 @@ def main():
         del condition
         torch.cuda.empty_cache()
 
+        timer.stop(_sample_total_h, "sample/total")
+        sample_title = f"Sample {sample_idx + 1}/{total} timing" + (
+            f" — {sample_name}" if sample_name else ""
+        )
+        timer.report_since(sample_snap, sample_title)
+
     # Cleanup
     del model
     torch.cuda.empty_cache()
     print(f"\nDone! Processed {total} sample(s) × {len(mode_plan)} mode(s).")
+
+    if args.profile_timing:
+        timer.report(f"Cumulative timing across {total} sample(s) × {len(mode_plan)} mode(s)")
 
 
 if __name__ == "__main__":
