@@ -83,6 +83,7 @@ class InfiniteTalkSelfForcingModel(SelfForcingModel):
                 if has_lora(self.fake_score):
                     freeze_base(self.fake_score)
             self._apply_anchor_config()
+            self._apply_running_ahead_config()  # KF: stamp running-ahead attrs on student
             return
 
         # === Sequential build + FSDP shard ===
@@ -166,6 +167,7 @@ class InfiniteTalkSelfForcingModel(SelfForcingModel):
         # Mark that FSDP wrapping is already done (trainer should skip its own)
         self._fsdp_already_wrapped = True
         self._apply_anchor_config()
+        self._apply_running_ahead_config()  # KF: stamp running-ahead attrs on student
 
     def _apply_anchor_config(self):
         """Apply first-frame anchor configuration to student, teacher, and fake_score.
@@ -268,6 +270,34 @@ class InfiniteTalkSelfForcingModel(SelfForcingModel):
             logger.info("[attn] Skip clean cache pass: ENABLED (F3)")
         else:
             logger.info("[attn] Skip clean cache pass: disabled")
+
+    def _apply_running_ahead_config(self):
+        """Apply Knot Forcing running-ahead configuration to the student net.
+
+        Paper Section 3.3 — the reference image's RoPE position is maintained
+        "ahead" of the current generation chunk. Advancement logic lives in
+        `network_causal.advance_running_ahead`; this method stamps the initial
+        state on the module attributes that `_apply_window_rope` reads.
+
+        Only the causal student (`self.net`) needs these attrs. The teacher and
+        fake_score use `InfiniteTalkWan` (bidirectional, full attention, no
+        sliding-window sink) — running-ahead does not apply.
+        """
+        enabled = getattr(self.config, "use_running_ahead", False)
+        step = getattr(self.config, "running_ahead_step", 4)
+        init_n = getattr(self.config, "running_ahead_init_n", 8)
+
+        self.net._running_ahead_enabled = enabled
+        self.net._running_ahead_step = step
+        self.net._running_ahead_n = init_n
+
+        if enabled:
+            logger.info(
+                f"[running_ahead] Student: enabled "
+                f"(step={step}, init_n={init_n})"
+            )
+        else:
+            logger.info("[running_ahead] Student: disabled")
 
     @staticmethod
     def _get_free_ram_gb() -> float:

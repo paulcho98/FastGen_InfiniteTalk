@@ -207,3 +207,47 @@ def test_compute_sink_rope_position_missing_attrs_default_natural():
     class Bare:
         pass
     assert compute_sink_rope_position(Bare(), F_window=10) == 0
+
+
+def test_apply_running_ahead_config_on():
+    """Running-ahead config propagates to self.net when enabled."""
+    from fastgen.methods.infinitetalk_self_forcing import InfiniteTalkSelfForcingModel
+
+    class Stub: pass
+    model = Stub()
+    model.net = Stub()
+    model.fake_score = Stub()
+    model.teacher = Stub()
+    model.config = Stub()
+    model.config.use_running_ahead = True
+    model.config.running_ahead_step = 4
+    model.config.running_ahead_init_n = 8
+
+    InfiniteTalkSelfForcingModel._apply_running_ahead_config(model)
+
+    # Student gets the attrs stamped
+    assert model.net._running_ahead_enabled is True
+    assert model.net._running_ahead_step == 4
+    assert model.net._running_ahead_n == 8
+    # Teacher + fake_score do NOT (bidirectional, no sliding-window sink)
+    assert getattr(model.teacher, "_running_ahead_enabled", False) is False
+    assert getattr(model.fake_score, "_running_ahead_enabled", False) is False
+
+
+def test_apply_running_ahead_config_off():
+    """When use_running_ahead=False, net gets _running_ahead_enabled=False."""
+    from fastgen.methods.infinitetalk_self_forcing import InfiniteTalkSelfForcingModel
+
+    class Stub: pass
+    model = Stub()
+    model.net = Stub()
+    model.config = Stub()
+    model.config.use_running_ahead = False
+    model.config.running_ahead_step = 4
+    model.config.running_ahead_init_n = 8
+
+    InfiniteTalkSelfForcingModel._apply_running_ahead_config(model)
+    assert model.net._running_ahead_enabled is False
+    # Step and init_n are still stamped but inert
+    assert model.net._running_ahead_step == 4
+    assert model.net._running_ahead_n == 8
