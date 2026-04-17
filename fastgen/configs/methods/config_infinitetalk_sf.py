@@ -146,6 +146,31 @@ class InfiniteTalkSFModelConfig(SFModelConfig):
     # Gradient accumulation rounds (mirrored from trainer config for combined step scaling)
     grad_accum_rounds: int = 1
 
+    def validate_kf_flags(self):
+        """Validate KF flag combinations. Call after config is fully populated.
+
+        Enforces:
+          - use_running_ahead is incompatible with lookahead_sink_enabled
+            (both modify the sink's RoPE position).
+          - knot_size >= 1 when use_temporal_knot is enabled.
+          - running_ahead_step >= 1 when use_running_ahead is enabled.
+        """
+        if self.use_running_ahead and self.lookahead_sink_enabled:
+            raise ValueError(
+                "use_running_ahead=True is incompatible with "
+                "lookahead_sink_enabled=True: both mechanisms modify the sink's "
+                "RoPE position and cannot coexist. Pick one."
+            )
+        if self.use_temporal_knot and self.knot_size < 1:
+            raise ValueError(
+                f"knot_size must be >= 1 when use_temporal_knot=True, got {self.knot_size}"
+            )
+        if self.use_running_ahead and self.running_ahead_step < 1:
+            raise ValueError(
+                f"running_ahead_step must be >= 1 when use_running_ahead=True, "
+                f"got {self.running_ahead_step}"
+            )
+
 
 @attrs.define(slots=False)
 class Config(SFConfig):
