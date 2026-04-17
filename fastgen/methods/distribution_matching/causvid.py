@@ -128,28 +128,74 @@ class CausVidModel(DMD2Model):
         num_denoise_steps = len(t_list) - 1  # e.g., 4 for t_list length 5
         last_step_idx = num_denoise_steps - 1
 
+        # KF: read config flags stamped on net by _apply_running_ahead_config
+        use_knot = getattr(net, "_use_temporal_knot", False)
+        k = int(getattr(net, "_knot_size", 1)) if use_knot else 0
+        denoise_len = chunk_size + k  # c+k under KF, c otherwise
+
+        # KF extends the internal x buffer by k frames for the last chunk's knot slot.
+        # Writeback to the caller's x still uses only num_frames positions.
+        if use_knot:
+            # Extend x internally — clone so caller's tensor isn't affected in shape.
+            # We write back committed frames to x[:, :, start:end] where end = start + c.
+            extra_k = torch.randn(
+                x.shape[0], x.shape[1], k, x.shape[3], x.shape[4],
+                device=x.device, dtype=x.dtype,
+            )
+            x_internal = torch.cat([x, extra_k], dim=2)
+        else:
+            x_internal = x
+
+        # KF state — knot_latent buffer, populated at iter 0's last step, used at iter 1+
+        knot_latent = None
+
+        # Lazy import to avoid circular
+        from fastgen.networks.InfiniteTalk.network_causal import advance_running_ahead
+
         for i in range(max(1, num_chunks)):
             if num_chunks == 0:
-                start, end = 0, remaining_size
+                start, end_committed = 0, remaining_size
+                cur_denoise_len = remaining_size
             else:
                 start = 0 if i == 0 else chunk_size * i + remaining_size
-                end = chunk_size * (i + 1) + remaining_size
+                end_committed = chunk_size * (i + 1) + remaining_size
+                cur_denoise_len = denoise_len
+
+            cur_end = start + cur_denoise_len  # end of c+k window (= end_committed + k under KF)
 
             is_sink_chunk = (start == 0)
             f2_active = model_sink_cache and is_sink_chunk
-            do_cache_pass = (not skip_clean_cache) or f2_active
+            do_cache_pass = (not skip_clean_cache) or f2_active or use_knot
+            # KF forces separate cache pass (F3 off) so cache carries committed c frames only.
 
-            x_next = x[:, :, start:end, ...]
+            # Running-ahead: advance sink RoPE n if rollout cursor caught up.
+            if getattr(net, "_running_ahead_enabled", False):
+                advance_running_ahead(net, i=start, c=chunk_size, k=k)
+
+            x_next = x_internal[:, :, start:cur_end, ...]
+
+            # Build per-chunk condition: KF iter > 0 injects knot via condition key.
+            if use_knot and i > 0 and knot_latent is not None:
+                chunk_condition = dict(condition) if isinstance(condition, dict) else condition
+                if isinstance(chunk_condition, dict):
+                    chunk_condition["knot_latent_for_chunk_start"] = knot_latent
+                # Pin position 0 of x_next to clean knot so model sees clean input
+                x_next = x_next.clone()
+                x_next[:, :, 0:k] = knot_latent
+            else:
+                chunk_condition = condition
+
             for step in range(num_denoise_steps):
                 is_last = (step == last_step_idx)
-                store_kv_here = skip_clean_cache and is_last and not f2_active
+                store_kv_here = skip_clean_cache and is_last and not f2_active and not use_knot
                 apply_anchor_here = not (f2_active and is_last)
 
                 if debug_trace:
                     logger.info(
                         f"[sample_loop] chunk_idx={i} start={start} step={step} "
                         f"is_last={is_last} store_kv={store_kv_here} "
-                        f"apply_anchor={apply_anchor_here} f2_active={f2_active}"
+                        f"apply_anchor={apply_anchor_here} f2_active={f2_active} "
+                        f"use_knot={use_knot}"
                     )
 
                 t_cur = t_list[step].expand(batch_size)
@@ -157,7 +203,7 @@ class CausVidModel(DMD2Model):
                 x_next = net(
                     x_cur,
                     t_cur,
-                    condition=condition,
+                    condition=chunk_condition,
                     fwd_pred_type="x0",
                     cache_tag="pos",
                     cur_start_frame=start,
@@ -200,18 +246,37 @@ class CausVidModel(DMD2Model):
                         x_next = x_next.clone()
                         x_next[:, :, 0:1] = ffc[:, :, 0:1]
 
-            # Write displayed output. If F2 is active on this chunk, manually
-            # anchor frame 0 for display (the forward didn't anchor it because
-            # apply_anchor_here=False on the last denoise step).
-            if f2_active and isinstance(condition, dict) and "first_frame_cond" in condition:
-                x_display = x_next.clone()
-                x_display[:, :, 0:1] = condition["first_frame_cond"][:, :, 0:1]
-                x[:, :, start:end, ...] = x_display
+                    # KF iter > 0: re-pin knot at position 0 of x_next for next step
+                    if use_knot and i > 0 and knot_latent is not None:
+                        x_next = x_next.clone()
+                        x_next[:, :, 0:k] = knot_latent
+
+                # Last step: KF fusion + save knot
+                if is_last and use_knot:
+                    if i > 0 and knot_latent is not None:
+                        # Eq. 5 fusion at boundary frames
+                        x_next = x_next.clone()
+                        x_next[:, :, 0:k] = (knot_latent + x_next[:, :, 0:k]) / 2.0
+                    # Save new knot from last k frames of c+k prediction
+                    knot_latent = x_next[:, :, chunk_size:chunk_size + k].clone()
+
+            # Determine committed slice (what actually goes into x)
+            if use_knot:
+                committed = x_next[:, :, 0:chunk_size]
             else:
-                x[:, :, start:end, ...] = x_next
+                committed = x_next
+
+            # Write displayed output. If F2 is active on this chunk, manually anchor frame 0.
+            if f2_active and isinstance(condition, dict) and "first_frame_cond" in condition:
+                x_display = committed.clone()
+                x_display[:, :, 0:1] = condition["first_frame_cond"][:, :, 0:1]
+                x[:, :, start:end_committed, ...] = x_display
+            else:
+                x[:, :, start:end_committed, ...] = committed
 
             if do_cache_pass:
-                x_cache = x_next  # non-anchored when f2_active; anchored otherwise
+                # Under KF, we cache ONLY the committed c frames (not the knot).
+                x_cache = committed if use_knot else x_next
                 t_cache = t_list[-1].expand(batch_size)
                 if context_noise > 0:
                     t_cache = torch.full(
@@ -219,23 +284,21 @@ class CausVidModel(DMD2Model):
                         device=x.device, dtype=x.dtype,
                     )
                     x_cache = net.noise_scheduler.forward_process(
-                        x_next, torch.randn_like(x_next), t_cache,
+                        x_cache, torch.randn_like(x_cache), t_cache,
                     )
-                # apply_anchor=False for cache pass when F2 active (preserves
-                # model-generated frame 0 K/V in the cache).
                 apply_anchor_cache = not f2_active
 
                 if debug_trace:
                     logger.info(
                         f"[sample_loop] cache_pass chunk_idx={i} start={start} "
                         f"store_kv=True apply_anchor={apply_anchor_cache} "
-                        f"f2_active={f2_active}"
+                        f"f2_active={f2_active} use_knot={use_knot}"
                     )
 
                 _ = net(
                     x_cache,
                     t_cache,
-                    condition=condition,
+                    condition=condition,  # base condition (no knot key for cache pass)
                     fwd_pred_type="x0",
                     cache_tag="pos",
                     cur_start_frame=start,

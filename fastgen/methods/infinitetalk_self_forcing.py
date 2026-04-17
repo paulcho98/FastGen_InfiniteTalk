@@ -299,6 +299,18 @@ class InfiniteTalkSelfForcingModel(SelfForcingModel):
         else:
             logger.info("[running_ahead] Student: disabled")
 
+        # KF: also stamp temporal-knot config on net so the classmethod
+        # _student_sample_loop (validation path) can read it uniformly via
+        # getattr(net, ...).
+        use_knot = getattr(self.config, "use_temporal_knot", False)
+        k_size = int(getattr(self.config, "knot_size", 1))
+        self.net._use_temporal_knot = use_knot
+        self.net._knot_size = k_size
+        if use_knot:
+            logger.info(f"[temporal_knot] Student: enabled (k={k_size})")
+        else:
+            logger.info("[temporal_knot] Student: disabled")
+
     @staticmethod
     def _get_free_ram_gb() -> float:
         """Get free system RAM in GB."""
