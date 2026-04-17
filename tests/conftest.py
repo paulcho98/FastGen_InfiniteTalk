@@ -1,6 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Env shim: diffusers (as used by fastgen.networks.DiT.network) imports
+# `GroupName` from torch.distributed.distributed_c10d. That symbol was
+# removed from the torch 2.8 nv build we run. The symbol is only used at
+# import time, not at runtime, so aliasing it to `str` lets the diffusers
+# import succeed without affecting any runtime behavior. Must run before
+# any fastgen import.
+import torch.distributed.distributed_c10d as _dc10d
+if not hasattr(_dc10d, "GroupName"):
+    _dc10d.GroupName = str
+
 import gc
 import torch
 import pytest
