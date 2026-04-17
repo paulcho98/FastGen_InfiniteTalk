@@ -57,8 +57,8 @@ import torch
 
 def test_kf_config_flags_default_off():
     """KF flags must default to off — KF-off must be bit-exact to existing SF."""
-    from fastgen.configs.methods.config_infinitetalk_sf import InfiniteTalkSFConfig
-    cfg = InfiniteTalkSFConfig()
+    from fastgen.configs.methods.config_infinitetalk_sf import InfiniteTalkSFModelConfig
+    cfg = InfiniteTalkSFModelConfig()
     assert cfg.use_temporal_knot is False
     assert cfg.knot_size == 1
     assert cfg.use_running_ahead is False
@@ -70,11 +70,13 @@ def test_kf_config_flags_default_off():
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cd /data/.../FastGen_InfiniteTalk_knot && python -m pytest tests/test_knot_forcing.py::test_kf_config_flags_default_off -v`
-Expected: FAIL with `AttributeError: 'InfiniteTalkSFConfig' object has no attribute 'use_temporal_knot'`
+Expected: FAIL with `AttributeError: 'InfiniteTalkSFModelConfig' object has no attribute 'use_temporal_knot'`
 
-- [ ] **Step 3: Add fields to config dataclass**
+- [ ] **Step 3: Add fields to config class**
 
-In `fastgen/configs/methods/config_infinitetalk_sf.py`, inside the `@dataclass class InfiniteTalkSFConfig` definition (near the existing `student_anchor_eval_only` field), add:
+Note: `InfiniteTalkSFModelConfig` uses `@attrs.define(slots=False)` (not `@dataclass`). Fields are declared as `name: type = default`.
+
+In `fastgen/configs/methods/config_infinitetalk_sf.py`, inside the `InfiniteTalkSFModelConfig` class (near the existing `student_anchor_eval_only` field), add:
 
 ```python
     # ── Knot Forcing (KF) flags — all default off, KF-off = bit-exact existing SF ──
@@ -123,8 +125,8 @@ Append to `tests/test_knot_forcing.py`:
 ```python
 def test_kf_running_ahead_incompatible_with_lookahead_sink():
     """Running-ahead and F1 lookahead_sink both modify sink RoPE — must not coexist."""
-    from fastgen.configs.methods.config_infinitetalk_sf import InfiniteTalkSFConfig
-    cfg = InfiniteTalkSFConfig()
+    from fastgen.configs.methods.config_infinitetalk_sf import InfiniteTalkSFModelConfig
+    cfg = InfiniteTalkSFModelConfig()
     cfg.use_running_ahead = True
     cfg.lookahead_sink_enabled = True
     with pytest.raises(ValueError, match="running_ahead.*lookahead_sink"):
@@ -132,8 +134,8 @@ def test_kf_running_ahead_incompatible_with_lookahead_sink():
 
 
 def test_kf_validation_passes_when_only_one_is_on():
-    from fastgen.configs.methods.config_infinitetalk_sf import InfiniteTalkSFConfig
-    cfg = InfiniteTalkSFConfig()
+    from fastgen.configs.methods.config_infinitetalk_sf import InfiniteTalkSFModelConfig
+    cfg = InfiniteTalkSFModelConfig()
     cfg.use_running_ahead = True
     cfg.lookahead_sink_enabled = False
     cfg.validate_kf_flags()  # should not raise
@@ -146,7 +148,7 @@ Expected: FAIL (method `validate_kf_flags` not defined)
 
 - [ ] **Step 3: Add validator method**
 
-Add to `InfiniteTalkSFConfig` class body:
+Add to `InfiniteTalkSFModelConfig` class body:
 
 ```python
     def validate_kf_flags(self):
@@ -1497,9 +1499,9 @@ def test_kf_off_is_bit_exact_to_sf():
     a deterministic fixture checkpoint which is overkill here. Instead we
     verify the code path branching is clean.
     """
-    from fastgen.configs.methods.config_infinitetalk_sf import InfiniteTalkSFConfig
+    from fastgen.configs.methods.config_infinitetalk_sf import InfiniteTalkSFModelConfig
     
-    cfg = InfiniteTalkSFConfig()
+    cfg = InfiniteTalkSFModelConfig()
     # Verify all KF flags default off
     assert not cfg.use_temporal_knot
     assert not cfg.use_running_ahead
