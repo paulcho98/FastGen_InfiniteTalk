@@ -94,3 +94,72 @@ def test_build_y_knot_injection():
     )
     assert torch.allclose(y_iter0[:, 4:, 0:1], ffc[:, :, 0:1])  # reference, not knot
     assert torch.allclose(y_iter0[:, 0:4, 0:1], torch.ones(B, 4, 1, H, W))
+
+
+def test_advance_running_ahead_disabled():
+    """When _running_ahead_enabled is False, advance_running_ahead is a no-op."""
+    from fastgen.networks.InfiniteTalk.network_causal import advance_running_ahead
+
+    class Stub:
+        _running_ahead_enabled = False
+        _running_ahead_n = 0
+        _running_ahead_step = 4
+    net = Stub()
+    advanced, new_n = advance_running_ahead(net, i=100, c=3, k=1)
+    assert advanced is False
+    assert new_n == 0
+    assert net._running_ahead_n == 0  # unchanged
+
+
+def test_advance_running_ahead_no_trigger():
+    """When i + c + k <= n, no advancement."""
+    from fastgen.networks.InfiniteTalk.network_causal import advance_running_ahead
+
+    class Stub:
+        _running_ahead_enabled = True
+        _running_ahead_n = 8
+        _running_ahead_step = 4
+    net = Stub()
+    # i=0, c=3, k=1 → i+c+k = 4, not > 8
+    advanced, new_n = advance_running_ahead(net, i=0, c=3, k=1)
+    assert advanced is False
+    assert new_n == 8
+    assert net._running_ahead_n == 8
+
+
+def test_advance_running_ahead_fires():
+    """When i + c + k > n, advance by step."""
+    from fastgen.networks.InfiniteTalk.network_causal import advance_running_ahead
+
+    class Stub:
+        _running_ahead_enabled = True
+        _running_ahead_n = 8
+        _running_ahead_step = 4
+    net = Stub()
+    # i=6, c=3, k=1 → i+c+k = 10 > 8 → advance → new_n = 12
+    advanced, new_n = advance_running_ahead(net, i=6, c=3, k=1)
+    assert advanced is True
+    assert new_n == 12
+    assert net._running_ahead_n == 12
+
+
+def test_advance_running_ahead_multiple_fires():
+    """Sequential advancements update n correctly."""
+    from fastgen.networks.InfiniteTalk.network_causal import advance_running_ahead
+
+    class Stub:
+        _running_ahead_enabled = True
+        _running_ahead_n = 8
+        _running_ahead_step = 4
+    net = Stub()
+    # Fire once
+    advance_running_ahead(net, i=6, c=3, k=1)
+    assert net._running_ahead_n == 12
+    # Still fires when i+c+k > new n (i=9, new_n=12, 9+4=13 > 12)
+    advanced2, new_n2 = advance_running_ahead(net, i=9, c=3, k=1)
+    assert advanced2 is True
+    assert new_n2 == 16
+    # Next iter doesn't fire if caught up
+    advanced3, new_n3 = advance_running_ahead(net, i=12, c=3, k=1)
+    assert advanced3 is False
+    assert new_n3 == 16

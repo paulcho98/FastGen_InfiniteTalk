@@ -1154,6 +1154,34 @@ def _maybe_apply_input_anchor(
     return x_t
 
 
+def advance_running_ahead(net_module, i: int, c: int, k: int) -> tuple:
+    """Advance the net's running-ahead RoPE position if the rollout caught up.
+
+    Paper Section 3.3 / Algorithm 1 lines 6-9: when the generation cursor
+    `i` reaches `i + c + k > n`, advance `n` by `running_ahead_step` (`s`).
+    Caller is responsible for re-caching the sink KV at the new RoPE position.
+
+    Args:
+        net_module: the network module holding _running_ahead_enabled,
+            _running_ahead_n, _running_ahead_step attributes.
+        i: current committed-output cursor (== cur_start_frame of the next chunk).
+        c: chunk_size (committed frames per chunk).
+        k: knot_size.
+
+    Returns:
+        (advanced: bool, new_n: int) — whether n was advanced this call, and
+        its current value (after advance, or unchanged).
+    """
+    if not getattr(net_module, "_running_ahead_enabled", False):
+        return False, getattr(net_module, "_running_ahead_n", 0)
+    n = net_module._running_ahead_n
+    if i + c + k > n:
+        new_n = n + net_module._running_ahead_step
+        net_module._running_ahead_n = new_n
+        return True, new_n
+    return False, n
+
+
 class CausalInfiniteTalkWan(CausalFastGenNetwork):
     """Causal InfiniteTalk DiT for use as the student in Self-Forcing distillation.
 
