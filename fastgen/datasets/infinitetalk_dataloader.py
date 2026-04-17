@@ -48,6 +48,33 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 logger = logging.getLogger(__name__)
 
+
+def _maybe_swap_last_frame_ref(first_frame_cond: torch.Tensor,
+                                vae_latents: torch.Tensor,
+                                use_last_frame: bool) -> torch.Tensor:
+    """Optionally replace first_frame_cond[:, 0] with the last latent frame.
+
+    Paper Section 3.3 (Knot Forcing): training uses the clip's LAST frame as
+    the global context, not the first frame. Using vae_latents[:, -1] as the
+    source avoids re-encoding the dataset — it's not strictly equivalent to
+    VAE-encoding a last-frame-replicated video (VAE has temporal convolutions),
+    but captures the clip's semantic endpoint.
+
+    Args:
+        first_frame_cond: [C=16, T, H, W] — pre-existing first-frame-based ref.
+        vae_latents: [C=16, T, H, W] — full-clip VAE latent sequence.
+        use_last_frame: if True, swap; if False, return unchanged.
+
+    Returns:
+        first_frame_cond_maybe_swapped: [C=16, T, H, W].
+    """
+    if not use_last_frame:
+        return first_frame_cond
+    out = first_frame_cond.clone()
+    out[:, 0] = vae_latents[:, -1]
+    return out
+
+
 # Aspect-ratio buckets for 480p (627-class) — matches InfiniteTalk's original pipeline
 ASPECT_RATIO_627 = {
     '0.26': [320, 1216], '0.38': [384, 1024], '0.50': [448, 896],
@@ -482,6 +509,7 @@ class InfiniteTalkDataset(Dataset):
         weights_dir: str = None,
         wav2vec_dir: str = None,
         encode_device: str = "cuda:0",
+        use_last_frame_reference: bool = False,
     ):
         """
         Args:
@@ -521,6 +549,7 @@ class InfiniteTalkDataset(Dataset):
         self.quarter_res = quarter_res
         self._vae_suffix = "_quarter" if quarter_res else ""
         self.audio_data_root = audio_data_root
+        self.use_last_frame_reference = use_last_frame_reference
         self._lazy_enabled = False
 
         # --- Lazy caching setup ---
@@ -1086,6 +1115,13 @@ class InfiniteTalkDataset(Dataset):
         )
         # Slice to training length (must match real's temporal dim)
         first_frame_cond = first_frame_cond[:, :self.num_latent_frames]
+
+        # KF: optionally swap first_frame_cond[:, 0] for vae_latents[:, -1] (last-frame ref)
+        first_frame_cond = _maybe_swap_last_frame_ref(
+            first_frame_cond,
+            real,  # real is the sliced vae_latents
+            use_last_frame=getattr(self, "use_last_frame_reference", False),
+        )
 
         # --- CLIP features ---
         clip_features = torch.load(

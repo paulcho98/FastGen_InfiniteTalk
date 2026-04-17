@@ -251,3 +251,30 @@ def test_apply_running_ahead_config_off():
     # Step and init_n are still stamped but inert
     assert model.net._running_ahead_step == 4
     assert model.net._running_ahead_n == 8
+
+
+def test_maybe_swap_last_frame_ref_disabled():
+    """When use_last_frame=False, returns first_frame_cond unchanged."""
+    from fastgen.datasets.infinitetalk_dataloader import _maybe_swap_last_frame_ref
+    C, T, H, W = 16, 5, 4, 4
+    vae_latents = torch.arange(C * T * H * W, dtype=torch.float32).reshape(C, T, H, W)
+    first_frame_cond = torch.zeros(C, T, H, W)
+    first_frame_cond[:, 0] = 1.0
+
+    out = _maybe_swap_last_frame_ref(first_frame_cond.clone(), vae_latents, use_last_frame=False)
+    assert torch.allclose(out, first_frame_cond)
+
+
+def test_maybe_swap_last_frame_ref_enabled():
+    """When use_last_frame=True, position 0 is replaced with vae_latents[:, -1]."""
+    from fastgen.datasets.infinitetalk_dataloader import _maybe_swap_last_frame_ref
+    C, T, H, W = 16, 5, 4, 4
+    vae_latents = torch.arange(C * T * H * W, dtype=torch.float32).reshape(C, T, H, W)
+    first_frame_cond = torch.zeros(C, T, H, W)
+    first_frame_cond[:, 0] = 1.0
+
+    out = _maybe_swap_last_frame_ref(first_frame_cond.clone(), vae_latents, use_last_frame=True)
+    # Position 0 of first_frame_cond is now the last latent frame from vae_latents
+    assert torch.allclose(out[:, 0], vae_latents[:, -1])
+    # Positions 1..T-1 unchanged (still zeros from the original first_frame_cond)
+    assert torch.allclose(out[:, 1:], first_frame_cond[:, 1:])
